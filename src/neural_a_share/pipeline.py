@@ -158,15 +158,24 @@ class NeuralAlphaPipeline:
         )
 
     def _apply_observed_membership(self, frame: pd.DataFrame, strict: bool = True) -> pd.DataFrame:
+        # The override is deliberately explicit.  Applying the first observed
+        # snapshot to older rows would both erase the historical sample and
+        # falsely imply that membership was known at those dates.  Degraded
+        # research therefore keeps the cached bar universe unchanged and marks
+        # every resulting artifact as DEGRADED; strict mode remains fail-closed.
+        if not strict:
+            return frame
         snapshots = self.store.universe_snapshot_dates()
         audit = audit_survivorship(snapshots, frame["trade_date"].min() if not frame.empty else None)
-        if strict and audit.status != "PASS":
+        if audit.status != "PASS":
             raise ValueError(
                 "strict survivorship audit failed: " + audit.detail + ". "
-                "Do not backfill old membership from today's TickFlow catalog."
+                "Do not backfill old membership from today's TickFlow catalog. "
+                "For an explicitly DEGRADED research run, pass "
+                "--allow-degraded-survivorship."
             )
         if not snapshots:
-            return frame.iloc[0:0].copy() if strict else frame
+            return frame.iloc[0:0].copy()
         pieces = []
         ordered = sorted(snapshots)
         for index, snapshot_date in enumerate(ordered):
@@ -184,6 +193,7 @@ class NeuralAlphaPipeline:
         validation: pd.DataFrame,
         model_version: str,
         training_cutoff: pd.Timestamp,
+        survivorship_status: str = "PASS",
     ) -> tuple[MultiTaskMLP, FeatureNormalizer, CheckpointMetadata, Any]:
         label_columns = [f"label_{h}" for h in self.config.labels.horizons]
         train = train.dropna(subset=label_columns, how="all")
@@ -230,6 +240,7 @@ class NeuralAlphaPipeline:
             hidden_dims=tuple(self.config.model.hidden_dims),
             dropout=self.config.model.dropout,
             metrics=metrics,
+            survivorship_status=survivorship_status,
         )
         return model, normalizer, metadata, training_result
 
@@ -240,6 +251,13 @@ class NeuralAlphaPipeline:
         strict_membership = (
             self.config.data.strict_survivorship and not allow_degraded_survivorship
         )
+        survivorship_status = "PASS" if strict_membership else "DEGRADED"
+        if survivorship_status == "DEGRADED":
+            self.emit(
+                "DEGRADED survivorship mode: preserving the cached historical bar universe; "
+                "results are not strict Historical OOS",
+                0.005,
+            )
         loader = self._research_loader(strict_membership)
         self.emit("Scanning narrow annual research partitions", 0.01)
         index = loader.scan(mature_cutoff=latest)
@@ -271,11 +289,19 @@ class NeuralAlphaPipeline:
         train = prepared["train"]
         validation = prepared["validation"]
         version = make_model_version(latest, FEATURE_NAMES)
+        if survivorship_status == "DEGRADED":
+            version = f"{version}-degraded"
         self.emit(
             f"Training {version} on {len(train):,} rows; validation {len(validation):,}",
             0.05,
         )
-        model, normalizer, metadata, result = self._fit_one(train, validation, version, latest)
+        model, normalizer, metadata, result = self._fit_one(
+            train,
+            validation,
+            version,
+            latest,
+            survivorship_status=survivorship_status,
+        )
         checkpoint = self.config.paths.models_dir / version / "checkpoint.pt"
         save_checkpoint(checkpoint, model, normalizer, metadata, result)
         role = "champion" if self.registry.read().get("champion") is None else "challenger"
@@ -290,6 +316,13 @@ class NeuralAlphaPipeline:
                 "validation_start": validation_dates[0],
                 "validation_end": validation_dates[-1],
                 "purge_days": purge,
+                "survivorship_status": survivorship_status,
+                "survivorship_detail": (
+                    "membership was known at each signal date"
+                    if strict_membership
+                    else "explicit override kept the cached historical bar universe; "
+                    "current catalog membership was not represented as historical PIT membership"
+                ),
                 "metrics": metadata.metrics,
                 "role": role,
             },
@@ -305,6 +338,18 @@ class NeuralAlphaPipeline:
         strict_membership = (
             self.config.data.strict_survivorship and not allow_degraded_survivorship
         )
+        survivorship_status = "PASS" if strict_membership else "DEGRADED"
+        sample_zone = (
+            "HISTORICAL_OOS"
+            if strict_membership
+            else "HISTORICAL_OOS_DEGRADED"
+        )
+        if survivorship_status == "DEGRADED":
+            self.emit(
+                "DEGRADED survivorship mode: walk-forward dates and purge/embargo are unchanged, "
+                "but results are not strict Historical OOS",
+                0.005,
+            )
         loader = self._research_loader(strict_membership)
         self.emit("Scanning narrow annual research partitions", 0.01)
         index = loader.scan()
@@ -349,8 +394,14 @@ class NeuralAlphaPipeline:
             validation = prepared["validation"]
             test = prepared["test"]
             version = f"wf-{fold.fold_id}-{fold.test_dates[0].date()}"
+            if survivorship_status == "DEGRADED":
+                version = f"{version}-degraded"
             model, normalizer, _, _ = self._fit_one(
-                train, validation, version, fold.training_cutoff
+                train,
+                validation,
+                version,
+                fold.training_cutoff,
+                survivorship_status=survivorship_status,
             )
             test_features = test.dropna(subset=FEATURE_NAMES, how="all").copy()
             scored = inference_frame(
@@ -361,16 +412,28 @@ class NeuralAlphaPipeline:
                 self.config.model.device,
             )
             scored["fold_id"] = fold.fold_id
-            scored["sample_zone"] = "HISTORICAL_OOS"
+            scored["sample_zone"] = sample_zone
             predictions.append(scored)
-            fold_rows.append(fold.as_dict())
+            fold_row = fold.as_dict()
+            fold_row["survivorship_status"] = survivorship_status
+            fold_row["sample_zone"] = sample_zone
+            fold_rows.append(fold_row)
         output = pd.concat(predictions, ignore_index=True) if predictions else pd.DataFrame()
         destination = self.config.paths.backtests_dir / "walk_forward_predictions.parquet"
         ParquetStore._atomic_parquet(output, destination)
         pd.DataFrame(fold_rows).to_csv(
             self.config.paths.backtests_dir / "walk_forward_folds.csv", index=False
         )
-        self.emit(f"Historical OOS predictions: {len(output):,}", 1.0)
+        self.store.write_manifest(
+            "walk_forward",
+            {
+                "survivorship_status": survivorship_status,
+                "sample_zone": sample_zone,
+                "folds": len(fold_rows),
+                "predictions": len(output),
+            },
+        )
+        self.emit(f"{sample_zone} predictions: {len(output):,}", 1.0)
         return output
 
     def run_backtest(self) -> BacktestResult:
@@ -558,7 +621,12 @@ class NeuralAlphaPipeline:
             quantiles = quantile_monotonicity(joined, "NeuralAlpha", "raw_return_20")
             research.update(
                 {
-                    "historical_oos_status": "PASS",
+                    "historical_oos_status": (
+                        "DEGRADED"
+                        if "sample_zone" in oos
+                        and oos["sample_zone"].astype(str).str.contains("DEGRADED").any()
+                        else "PASS"
+                    ),
                     "icir": " / ".join(_display(research.get(f"icir_{h}")) for h in self.config.labels.horizons),
                     "newey_west_t": " / ".join(_display(research.get(f"nw_t_{h}")) for h in self.config.labels.horizons),
                     "mature_labels": f"{joined[[f'label_{h}' for h in self.config.labels.horizons]].notna().all(axis=1).sum():,}",
@@ -566,6 +634,7 @@ class NeuralAlphaPipeline:
                 }
             )
         training = self.store.read_manifest("training")
+        training_status = training.get("survivorship_status", "PASS") if training else "PENDING"
         fold_path = self.config.paths.backtests_dir / "walk_forward_folds.csv"
         if fold_path.exists():
             folds = pd.read_csv(fold_path)
@@ -573,8 +642,12 @@ class NeuralAlphaPipeline:
             research["split_summary"] = f"{len(folds)} expanding folds"
         research.update(
             {
-                "in_sample_status": "RECORDED" if training else "PENDING",
-                "validation_status": "RECORDED" if training else "PENDING",
+                "in_sample_status": (
+                    "DEGRADED" if training_status == "DEGRADED" else "RECORDED"
+                ) if training else "PENDING",
+                "validation_status": (
+                    "DEGRADED" if training_status == "DEGRADED" else "RECORDED"
+                ) if training else "PENDING",
                 "train_period": f"{training.get('train_start','N/A')} — {training.get('train_end','N/A')}",
                 "validation_period": f"{training.get('validation_start','N/A')} — {training.get('validation_end','N/A')}",
                 "shadow_status": "PENDING",
@@ -591,8 +664,27 @@ class NeuralAlphaPipeline:
             pit = reconstruct_pit_prices(bars)
             benchmark_nav = pit[["trade_date", "pit_close"]].rename(columns={"pit_close": "nav"})
         audit = audit_survivorship(self.store.universe_snapshot_dates(), nav["trade_date"].min() if not nav.empty else None)
+        walk_forward = self.store.read_manifest("walk_forward")
+        declared_statuses = {
+            audit.status,
+            training.get("survivorship_status"),
+            walk_forward.get("survivorship_status"),
+        }
+        if "DEGRADED" in declared_statuses:
+            survivorship_status = "DEGRADED"
+        elif "FAIL" in declared_statuses:
+            survivorship_status = "FAIL"
+        else:
+            survivorship_status = "PASS"
+        if (
+            research.get("historical_oos_status") == "PASS"
+            and survivorship_status != "PASS"
+        ):
+            research["historical_oos_status"] = survivorship_status
         quality_dict = quality.to_dict()
-        quality_dict.update({"pit_status": "PASS", "survivorship_status": audit.status})
+        quality_dict.update(
+            {"pit_status": "PASS", "survivorship_status": survivorship_status}
+        )
         return ReportContext(
             data_date=str(pd.Timestamp(latest).date()),
             tickflow_status=quality.status,

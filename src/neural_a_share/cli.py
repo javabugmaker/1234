@@ -29,12 +29,19 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument(
         "--allow-degraded-survivorship",
         action="store_true",
-        help="research-only override; result must not be labelled strict OOS",
+        help=(
+            "research-only override that keeps the cached historical bar universe; "
+            "all outputs are marked DEGRADED, never strict OOS"
+        ),
     )
 
     walk = sub.add_parser("walk-forward", help="expanding purged walk-forward")
     walk.add_argument("--max-folds", type=int)
-    walk.add_argument("--allow-degraded-survivorship", action="store_true")
+    walk.add_argument(
+        "--allow-degraded-survivorship",
+        action="store_true",
+        help="keep cached historical rows and mark every OOS artifact DEGRADED",
+    )
 
     sub.add_parser("backtest", help="backtest historical OOS predictions")
     daily = sub.add_parser("daily", help="increment, infer, rank and publish daily pages")

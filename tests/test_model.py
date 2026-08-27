@@ -44,7 +44,16 @@ def test_checkpoint_round_trip(tmp_path) -> None:
     names = ("f1", "f2", "f3")
     model = MultiTaskMLP(3, hidden_dims=(8, 4, 2), dropout=0.0, horizons=(20, 40, 60))
     normalizer = FeatureNormalizer().fit(np.arange(30, dtype=float).reshape(10, 3))
-    metadata = CheckpointMetadata("test-v1", "2024-01-31", names, (20, 40, 60), (8, 4, 2), 0.0, {"rank_ic_20": 0.1})
+    metadata = CheckpointMetadata(
+        "test-v1",
+        "2024-01-31",
+        names,
+        (20, 40, 60),
+        (8, 4, 2),
+        0.0,
+        {"rank_ic_20": 0.1},
+        survivorship_status="DEGRADED",
+    )
     path = save_checkpoint(tmp_path / "checkpoint.pt", model, normalizer, metadata)
     loaded, loaded_normalizer, loaded_meta = load_checkpoint(path)
     assert loaded_meta == metadata

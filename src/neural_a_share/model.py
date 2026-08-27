@@ -308,6 +308,7 @@ class CheckpointMetadata:
     hidden_dims: tuple[int, ...]
     dropout: float
     metrics: dict[str, float]
+    survivorship_status: str = "PASS"
 
 
 def make_model_version(training_cutoff: str | pd.Timestamp, feature_names: Iterable[str]) -> str:
@@ -358,6 +359,7 @@ def load_checkpoint(path: str | Path, map_location: str = "cpu") -> tuple[MultiT
         hidden_dims=tuple(raw["hidden_dims"]),
         dropout=float(raw["dropout"]),
         metrics=dict(raw.get("metrics", {})),
+        survivorship_status=str(raw.get("survivorship_status", "PASS")),
     )
     model = MultiTaskMLP(
         input_dim=len(metadata.feature_names),
@@ -388,6 +390,7 @@ class ModelRegistry:
             "checkpoint": str(checkpoint),
             "training_cutoff": metadata.training_cutoff,
             "metrics": metadata.metrics,
+            "survivorship_status": metadata.survivorship_status,
             "registered_at": datetime.now(timezone.utc).isoformat(),
         }
         if role == "champion":

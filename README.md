@@ -35,7 +35,7 @@ TickFlow 免费服务当前可返回“查询当日看到的交易所目录”�
 1. 每次更新都会保存不可变的 TickFlow universe snapshot。
 2. strict 模式只允许某个信号日使用该日以前已观察到的 snapshot。
 3. 如果回测开始日期早于第一份 snapshot，训练和 Walk-Forward 默认直接失败，并在周报显示 `DEGRADED/FAIL`。
-4. `--allow-degraded-survivorship` 是显式的研究调试开关，不能把其结果标成 strict Historical OOS。
+4. `--allow-degraded-survivorship` 是显式的研究调试开关：它保留已有历史 K 线样本、不把首份快照错误套用到过去；模型版本、checkpoint、训练清单和 Walk-Forward 输出都会标记为 `DEGRADED`，不能把其结果标成 strict Historical OOS。
 
 这是有意的安全阀。免费服务无法提供的信息不能靠代码猜出来；随着每日 snapshot 积累，Forward Shadow OOS 会自然成为严格无幸存者偏差的样本。
 
@@ -89,6 +89,8 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\neural-alpha.exe train --allow-degraded-survivorship
 .\.venv\Scripts\neural-alpha.exe walk-forward --max-folds 2 --allow-degraded-survivorship
 ```
+
+该开关不会改变 Feature、Label、日期切分、Purge/Embargo 或训练抽样，只跳过无法由免费服务追溯证明的历史 membership 过滤。它不能消除现有历史缓存可能包含的 Survivorship Bias；严格模式仍会 fail-closed，且不会自动降级。
 
 常用入口也可直接运行：
 
