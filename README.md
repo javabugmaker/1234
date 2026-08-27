@@ -90,6 +90,11 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\neural-alpha.exe walk-forward --max-folds 2 --allow-degraded-survivorship
 ```
 
+Walk Forward 默认启用逐折断点续跑。输入数据、折边界、Feature、模型配置或
+Survivorship 模式的签名没有变化时，已完成折会直接复用；需要强制重算所选折时添加
+`--no-resume`。`--max-folds 2` 只发布最近两折并明确标为 `PARTIAL`，不能当成完整
+Historical OOS；不传 `--max-folds` 才发布全部可用折。
+
 该开关不会改变 Feature、Label、日期切分、Purge/Embargo 或训练抽样，只跳过无法由免费服务追溯证明的历史 membership 过滤。它不能消除现有历史缓存可能包含的 Survivorship Bias；严格模式仍会 fail-closed，且不会自动降级。
 
 常用入口也可直接运行：
@@ -109,6 +114,13 @@ py -3.11 -m venv .venv
 在 Arrow 转为 pandas 之前收窄为 `float32`；Validation 保留全部验证日期及可计算
 Rank IC 的横截面结构。现有 `data/cache/derived/**/year=YYYY/*.parquet` 可直接使用，
 不需要重新下载 TickFlow，也不需要重跑 `update --full` 或 `features`。
+
+首次训练或 Walk Forward 会从这些现有分区逐年生成
+`data/cache/derived/research_cache/year=YYYY/research.parquet`。后续 expanding folds 直接读取
+已校验的合并分区，避免反复 merge 和排序。训练 DataLoader 使用张量批量索引，避免
+逐行 Python collation；GPU loss 只在每个 epoch 结束时同步。每折预测会立即原子写入
+`data/backtests/walk_forward_cache/fold=NNN/`，中断后无需从第 1 折重来，最终结果也按折
+流式合并，不会一次性 `concat` 全部 OOS 预测。
 
 ## DAILY
 
@@ -154,6 +166,7 @@ TickFlow.free() 增量日 K
 - CUDA/GPU 或 CPU fallback
 - Champion 版本与 TrainingCutoff
 - 显式 `DEGRADED 研究模式` 开关；当前 Champion 已标记 degraded 时首次启动会自动勾选
+- Walk Forward 范围选择：最近 2 折（默认快速）、5 折、10 折或全部折；自动断点续跑
 - Rolling IC20/40/60
 - Top 股票、Alpha20/40/60、NeuralAlpha、NeuralRank
 - 进度、日志和 Champion/Challenger 管理
@@ -161,6 +174,7 @@ TickFlow.free() 增量日 K
 GUI 中“训练模型”和“Walk Forward”使用同一个 Survivorship 模式开关。关闭时严格
 fail-closed；开启时保留历史缓存样本，并把模型和 Walk-Forward 产物明确标记为
 `DEGRADED`，不会改变日期切分、Purge/Embargo 或统计口径。
+快速范围的产物同时标记 `PARTIAL`；要生成完整历史 OOS 报告，请选择“全部折（完整范围）”。
 
 ## 测试
 
@@ -168,7 +182,9 @@ fail-closed；开启时保留历史缓存样本，并把模型和 Walk-Forward �
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-测试覆盖 PIT、标签对齐与成熟度、Purge、Expanding Walk-Forward、checkpoint、CUDA/CPU fallback、Rank IC、T+1、股票/ETF 成本、退出顺延、Position Ledger、NAV 和 TickFlow 完整性。
+测试覆盖 PIT、标签对齐与成熟度、Purge、Expanding Walk-Forward、逐折缓存/断点续跑、
+年度研究缓存、向量批处理、checkpoint、CUDA/CPU fallback、Rank IC、T+1、股票/ETF
+成本、退出顺延、Position Ledger、NAV 和 TickFlow 完整性。
 
 ## 目录
 

@@ -47,6 +47,18 @@ class ParquetStore:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
+    @staticmethod
+    def _atomic_csv(frame: pd.DataFrame, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=path.name, suffix=".tmp", dir=path.parent)
+        os.close(fd)
+        try:
+            frame.to_csv(temporary, index=False)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
     def upsert_bars(self, bars: pd.DataFrame) -> int:
         if bars.empty:
             return 0
@@ -89,14 +101,30 @@ class ParquetStore:
             files = [p for p in files if int(p.parent.name.split("=")[1]) <= end_year]
         if not files:
             return pd.DataFrame()
-        frame = pd.concat((pd.read_parquet(path) for path in files), ignore_index=True)
+        wanted = sorted(set(symbols)) if symbols is not None else None
+        if wanted == []:
+            return pd.DataFrame()
+        parts: list[pd.DataFrame] = []
+        for path in files:
+            filters: list[tuple[str, str, Any]] = []
+            if start_date is not None:
+                filters.append(("trade_date", ">=", pd.Timestamp(start_date).normalize()))
+            if end_date is not None:
+                filters.append(("trade_date", "<=", pd.Timestamp(end_date).normalize()))
+            if wanted is not None:
+                filters.append(("symbol", "in", wanted))
+            part = pd.read_parquet(path, filters=filters or None, engine="pyarrow")
+            if not part.empty:
+                parts.append(part)
+        if not parts:
+            return pd.DataFrame()
+        frame = pd.concat(parts, ignore_index=True, copy=False)
         frame["trade_date"] = pd.to_datetime(frame["trade_date"]).dt.normalize()
         if start_date is not None:
             frame = frame[frame["trade_date"] >= pd.Timestamp(start_date).normalize()]
         if end_date is not None:
             frame = frame[frame["trade_date"] <= pd.Timestamp(end_date).normalize()]
-        if symbols is not None:
-            wanted = set(symbols)
+        if wanted is not None:
             frame = frame[frame["symbol"].isin(wanted)]
         return frame.sort_values(["trade_date", "symbol"]).reset_index(drop=True)
 
@@ -169,8 +197,21 @@ class ParquetStore:
         path = self.derived_dir / name / f"year={int(year)}" / f"{name}.parquet"
         if not path.exists():
             return pd.DataFrame(columns=list(columns) if columns is not None else None)
+        return self.read_parquet(path, columns=columns, float32_columns=float32_columns)
+
+    @staticmethod
+    def read_parquet(
+        path: str | Path,
+        columns: Iterable[str] | None = None,
+        float32_columns: Iterable[str] = (),
+    ) -> pd.DataFrame:
+        """Read a parquet file while narrowing floats before pandas materialization."""
+
+        source = Path(path)
+        if not source.exists():
+            return pd.DataFrame(columns=list(columns) if columns is not None else None)
         selected = list(columns) if columns is not None else None
-        table = pq.ParquetFile(path).read(columns=selected)
+        table = pq.ParquetFile(source).read(columns=selected)
         narrow = set(float32_columns)
         if narrow:
             arrays = []

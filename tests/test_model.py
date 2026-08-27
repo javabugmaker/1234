@@ -18,7 +18,10 @@ from neural_a_share.model import (
     load_checkpoint,
     save_checkpoint,
     select_device,
+    _VectorizedTensorDataset,
+    _identity_collate,
 )
+from torch.utils.data import DataLoader
 
 
 class _FakeCuda:
@@ -97,10 +100,33 @@ def test_mlp_trains_three_heads_on_cpu() -> None:
         device="cpu",
     )
     model = MultiTaskMLP(8, config.hidden_dims, 0.05)
-    result = NeuralTrainer(config).fit(model, x[:120], y[:120], x[120:], y[120:])
+    progress = []
+    result = NeuralTrainer(config).fit(
+        model,
+        x[:120],
+        y[:120],
+        x[120:],
+        y[120:],
+        progress=lambda *values: progress.append(values),
+    )
     assert result.device == "cpu"
     assert result.epochs_trained >= 1
+    assert len(progress) == result.epochs_trained
     assert model(torch.tensor(x[:2])).shape == (2, 3)
+
+
+def test_vectorized_tensor_dataset_preserves_batches_and_row_order() -> None:
+    features = torch.arange(310, dtype=torch.float32).reshape(31, 10)
+    targets = torch.arange(93, dtype=torch.float32).reshape(31, 3)
+    loader = DataLoader(
+        _VectorizedTensorDataset(features, targets),
+        batch_size=7,
+        shuffle=False,
+        collate_fn=_identity_collate,
+    )
+    batches = list(loader)
+    assert torch.equal(torch.cat([batch[0] for batch in batches]), features)
+    assert torch.equal(torch.cat([batch[1] for batch in batches]), targets)
 
 
 def test_inference_outputs_neural_rank() -> None:

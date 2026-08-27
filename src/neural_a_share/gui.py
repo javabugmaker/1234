@@ -14,6 +14,19 @@ from .config import load_config
 from .model import ModelRegistry, select_device
 from .pipeline import NeuralAlphaPipeline
 
+WALK_FORWARD_SCOPES: dict[str, int | None] = {
+    "最近 2 折（快速）": 2,
+    "最近 5 折": 5,
+    "最近 10 折": 10,
+    "全部折（完整范围）": None,
+}
+
+
+def _walk_forward_max_folds(label: str) -> int | None:
+    if label not in WALK_FORWARD_SCOPES:
+        raise ValueError(f"unknown Walk Forward scope: {label}")
+    return WALK_FORWARD_SCOPES[label]
+
 
 def _model_is_degraded(champion: str | None, model: dict[str, Any]) -> bool:
     """Recover the explicit GUI research mode from persisted model metadata."""
@@ -51,7 +64,9 @@ class NeuralAlphaApp:
         self.busy = False
         self.status_vars: dict[str, tk.StringVar] = {}
         self.buttons: list[Any] = []
+        self.readonly_controls: list[Any] = []
         self.allow_degraded_survivorship = False
+        self.walk_forward_max_folds: int | None = 2
         self._survivorship_mode_initialized = False
         self._style()
         self._build()
@@ -126,7 +141,28 @@ class NeuralAlphaApp:
             textvariable=self.degraded_mode_text,
             foreground="#ffb45f",
         ).pack(side="left", padx=14)
+        self.walk_forward_scope_var = self.tk.StringVar(
+            value="最近 2 折（快速）"
+        )
+        self.ttk.Label(
+            mode_bar,
+            text="WF 范围（自动断点续跑）",
+            foreground="#8fa5bd",
+        ).pack(side="right", padx=(12, 6))
+        self.walk_forward_scope = self.ttk.Combobox(
+            mode_bar,
+            textvariable=self.walk_forward_scope_var,
+            values=tuple(WALK_FORWARD_SCOPES),
+            state="readonly",
+            width=20,
+        )
+        self.walk_forward_scope.pack(side="right")
+        self.walk_forward_scope.bind(
+            "<<ComboboxSelected>>", self._sync_walk_forward_scope
+        )
+        self.readonly_controls.append(self.walk_forward_scope)
         self._sync_degraded_mode()
+        self._sync_walk_forward_scope()
 
         toolbar = self.ttk.Frame(self.root)
         toolbar.pack(fill="x", padx=22, pady=9)
@@ -207,9 +243,16 @@ class NeuralAlphaApp:
             allow_degraded_survivorship=self.allow_degraded_survivorship
         )
 
-    def _walk_forward(self) -> pd.DataFrame:
+    def _sync_walk_forward_scope(self, _event: Any | None = None) -> None:
+        self.walk_forward_max_folds = _walk_forward_max_folds(
+            self.walk_forward_scope_var.get()
+        )
+
+    def _walk_forward(self) -> Any:
         return self._pipeline().walk_forward(
-            allow_degraded_survivorship=self.allow_degraded_survivorship
+            max_folds=getattr(self, "walk_forward_max_folds", 2),
+            allow_degraded_survivorship=self.allow_degraded_survivorship,
+            resume=True,
         )
 
     def _run(self, name: str, callback: Callable[[], Any]) -> None:
@@ -264,6 +307,8 @@ class NeuralAlphaApp:
         state = "normal" if enabled else "disabled"
         for button in self.buttons:
             button.configure(state=state)
+        for control in self.readonly_controls:
+            control.configure(state="readonly" if enabled else "disabled")
 
     def _append_log(self, message: str) -> None:
         self.log.insert("end", message.rstrip() + "\n")

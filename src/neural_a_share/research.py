@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import gc
+import hashlib
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 import numpy as np
@@ -11,6 +14,8 @@ from .data.store import ParquetStore
 
 KEY_COLUMNS = ("symbol", "trade_date")
 RowFilter = Callable[[pd.DataFrame], pd.DataFrame]
+CacheProgress = Callable[[str], None]
+RESEARCH_CACHE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -47,6 +52,7 @@ class PartitionedResearchLoader:
         feature_names: Sequence[str],
         horizons: Sequence[int],
         row_filter: RowFilter | None = None,
+        cache_progress: CacheProgress | None = None,
     ) -> None:
         self.store = store
         self.feature_names = tuple(feature_names)
@@ -56,6 +62,10 @@ class PartitionedResearchLoader:
             f"label_available_date_{value}" for value in self.horizons
         )
         self.row_filter = row_filter
+        self.cache_progress = cache_progress
+        self.cache_dir = self.store.derived_dir / "research_cache"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._validated_cache_signatures: set[tuple[int, str]] = set()
 
     def years(self) -> tuple[int, ...]:
         # An inner merge across the old monolithic frames implicitly ignored a
@@ -75,6 +85,32 @@ class PartitionedResearchLoader:
 
         feature_columns = tuple(dict.fromkeys(feature_columns))
         label_columns = tuple(dict.fromkeys(label_columns))
+        cached = self._read_cached_partition(year, feature_columns, label_columns)
+        if cached is not None:
+            return cached
+
+        if feature_columns == self.feature_names:
+            canonical_labels = tuple(
+                dict.fromkeys((*self.label_columns, *self.maturity_columns))
+            )
+            if self.cache_progress is not None:
+                self.cache_progress(f"Building merged research cache year={year}")
+            merged = self._read_source_partition(
+                year, self.feature_names, canonical_labels
+            )
+            if not merged.empty:
+                self._write_cached_partition(year, merged)
+            requested = [*KEY_COLUMNS, *feature_columns, *label_columns]
+            return merged[requested].copy() if not merged.empty else merged[requested]
+
+        return self._read_source_partition(year, feature_columns, label_columns)
+
+    def _read_source_partition(
+        self,
+        year: int,
+        feature_columns: Sequence[str],
+        label_columns: Sequence[str],
+    ) -> pd.DataFrame:
         feature_request = [*KEY_COLUMNS, *feature_columns]
         label_request = [*KEY_COLUMNS, *label_columns]
         features = self.store.read_derived_year(
@@ -113,6 +149,107 @@ class PartitionedResearchLoader:
             if column in merged and column not in self.maturity_columns:
                 merged[column] = merged[column].astype("float32", copy=False)
         return merged.sort_values(["trade_date", "symbol"]).reset_index(drop=True)
+
+    def _cache_paths(self, year: int) -> tuple[Path, Path]:
+        directory = self.cache_dir / f"year={int(year)}"
+        return directory / "research.parquet", directory / "manifest.json"
+
+    def _source_signature(self, year: int) -> str:
+        sources = []
+        for name in ("features", "labels"):
+            path = (
+                self.store.derived_dir
+                / name
+                / f"year={int(year)}"
+                / f"{name}.parquet"
+            )
+            stat = path.stat()
+            sources.append(
+                {
+                    "name": name,
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                }
+            )
+        payload = {
+            "version": RESEARCH_CACHE_VERSION,
+            "year": int(year),
+            "feature_names": self.feature_names,
+            "label_columns": self.label_columns,
+            "maturity_columns": self.maturity_columns,
+            "sources": sources,
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _read_cached_partition(
+        self,
+        year: int,
+        feature_columns: Sequence[str],
+        label_columns: Sequence[str],
+    ) -> pd.DataFrame | None:
+        data_path, manifest_path = self._cache_paths(year)
+        if not data_path.exists() or not manifest_path.exists():
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            source_signature = self._source_signature(year)
+            if manifest.get("source_signature") != source_signature:
+                return None
+            requested = [*KEY_COLUMNS, *feature_columns, *label_columns]
+            if not set(requested).issubset(set(manifest.get("columns", []))):
+                return None
+            numeric = [
+                column
+                for column in (*feature_columns, *label_columns)
+                if column not in self.maturity_columns
+            ]
+            frame = self.store.read_parquet(
+                data_path,
+                columns=requested,
+                float32_columns=numeric,
+            )
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            return None
+        validation_key = (int(year), source_signature)
+        if not frame.empty:
+            frame["trade_date"] = pd.to_datetime(frame["trade_date"]).dt.normalize()
+            if (
+                validation_key not in self._validated_cache_signatures
+                and frame.duplicated(list(KEY_COLUMNS)).any()
+            ):
+                raise ValueError(
+                    f"research cache year={year} violates symbol + trade_date one-to-one"
+                )
+        self._validated_cache_signatures.add(validation_key)
+        # Cache files are written in source merge order (trade_date, symbol).
+        # Avoid re-sorting the same annual partition for every expanding fold.
+        return frame.reset_index(drop=True)
+
+    def _write_cached_partition(self, year: int, frame: pd.DataFrame) -> None:
+        data_path, manifest_path = self._cache_paths(year)
+        columns = [
+            *KEY_COLUMNS,
+            *self.feature_names,
+            *self.label_columns,
+            *self.maturity_columns,
+        ]
+        cached = frame if list(frame.columns) == columns else frame[columns]
+        for column in (*self.feature_names, *self.label_columns):
+            if cached[column].dtype != np.dtype("float32"):
+                cached[column] = cached[column].astype("float32", copy=False)
+        self.store._atomic_parquet(cached, data_path)
+        self.store._atomic_json(
+            {
+                "version": RESEARCH_CACHE_VERSION,
+                "source_signature": self._source_signature(year),
+                "rows": len(cached),
+                "columns": columns,
+            },
+            manifest_path,
+        )
 
     def scan(self, mature_cutoff: pd.Timestamp | None = None) -> ResearchIndex:
         years = self.years()

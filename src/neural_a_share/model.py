@@ -9,7 +9,7 @@ import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
 import pandas as pd
@@ -24,6 +24,32 @@ except ImportError:  # pragma: no cover - exercised through explicit dependency 
     DataLoader = TensorDataset = None
 
 from .config import ModelConfig
+
+TrainingProgress = Callable[[int, int, float, float], None]
+
+
+if torch is not None:
+
+    class _VectorizedTensorDataset(TensorDataset):
+        """Fetch a complete batch with one tensor index operation.
+
+        PyTorch's normal ``TensorDataset`` path calls ``__getitem__`` once per
+        row before collating.  Implementing ``__getitems__`` keeps the same
+        sampler and row order while removing millions of Python-level calls.
+        """
+
+        def __getitems__(self, indices: Sequence[int]) -> tuple[Any, ...]:
+            return tuple(tensor[indices] for tensor in self.tensors)
+
+
+else:  # pragma: no cover - dependency error is raised before construction
+
+    class _VectorizedTensorDataset:  # type: ignore[no-redef]
+        pass
+
+
+def _identity_collate(batch: Any) -> Any:
+    return batch
 
 
 def require_torch() -> Any:
@@ -158,6 +184,20 @@ def _masked_huber(prediction: Any, target: Any, delta: float) -> Any:
     return losses
 
 
+def _masked_huber_known_nonempty(prediction: Any, target: Any, delta: float) -> Any:
+    """Huber loss for frames already filtered to at least one label per row.
+
+    Avoiding ``bool(mask.any())`` removes a forced CUDA synchronization from
+    every training batch.  ``_fit_one`` guarantees this precondition before
+    tensors reach the trainer.
+    """
+
+    mask = torch.isfinite(target)
+    return torch.nn.functional.huber_loss(
+        prediction[mask], target[mask], delta=float(delta), reduction="mean"
+    )
+
+
 @dataclass(frozen=True)
 class TrainingResult:
     best_validation_loss: float
@@ -180,12 +220,13 @@ class NeuralTrainer:
         train_y: np.ndarray,
         validation_x: np.ndarray,
         validation_y: np.ndarray,
+        progress: TrainingProgress | None = None,
     ) -> TrainingResult:
         set_seed(self.config.seed)
         device_name = select_device(self.config.device)
         device = torch.device(device_name)
         model.to(device)
-        dataset = TensorDataset(
+        dataset = _VectorizedTensorDataset(
             torch.as_tensor(train_x, dtype=torch.float32),
             torch.as_tensor(train_y, dtype=torch.float32),
         )
@@ -196,6 +237,7 @@ class NeuralTrainer:
             num_workers=int(self.config.num_workers),
             pin_memory=device.type == "cuda",
             drop_last=False,
+            collate_fn=_identity_collate,
         )
         validation_features = torch.as_tensor(validation_x, dtype=torch.float32, device=device)
         validation_targets = torch.as_tensor(validation_y, dtype=torch.float32, device=device)
@@ -217,7 +259,7 @@ class NeuralTrainer:
 
         for epoch in range(1, int(self.config.epochs) + 1):
             model.train()
-            running = 0.0
+            running = torch.zeros((), dtype=torch.float32, device=device)
             batches = 0
             for batch_x, batch_y in loader:
                 batch_x = batch_x.to(device, non_blocking=True)
@@ -225,24 +267,33 @@ class NeuralTrainer:
                 optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, enabled=amp_enabled):
                     predictions = model(batch_x)
-                    loss = _masked_huber(predictions, batch_y, self.config.huber_delta)
+                    loss = _masked_huber_known_nonempty(
+                        predictions, batch_y, self.config.huber_delta
+                    )
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), self.config.gradient_clip_norm)
                 scaler.step(optimizer)
                 scaler.update()
-                running += float(loss.detach().cpu())
+                running += loss.detach().float()
                 batches += 1
             model.eval()
             with torch.no_grad(), torch.autocast(device_type=device.type, enabled=amp_enabled):
                 validation_predictions = model(validation_features)
                 validation_loss = float(
-                    _masked_huber(
+                    _masked_huber_known_nonempty(
                         validation_predictions, validation_targets, self.config.huber_delta
                     ).detach().cpu()
                 )
-            train_loss = running / max(batches, 1)
+            train_loss = float((running / max(batches, 1)).cpu())
             history.append({"epoch": float(epoch), "train_loss": train_loss, "validation_loss": validation_loss})
+            if progress is not None:
+                progress(
+                    epoch,
+                    int(self.config.epochs),
+                    train_loss,
+                    validation_loss,
+                )
             if validation_loss < best_loss - float(self.config.min_delta):
                 best_loss = validation_loss
                 best_state = copy.deepcopy(model.state_dict())

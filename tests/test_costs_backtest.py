@@ -6,7 +6,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from neural_a_share.backtest import PortfolioBacktester, estimate_cost
+from neural_a_share.backtest import (
+    PortfolioBacktester,
+    estimate_cost,
+    prepare_signal_targets,
+)
 from neural_a_share.config import PortfolioConfig
 
 
@@ -93,3 +97,28 @@ def test_exit_stays_in_nav_after_ten_failed_sessions(small_market) -> None:
     ]
     assert len(unresolved) == 1
     assert result.position_ledger["status"].eq("LOCKED_UNRESOLVED").any()
+
+
+def test_vectorized_signal_targets_match_reference_t_plus_one_loop() -> None:
+    calendar = pd.bdate_range("2024-01-02", periods=8)
+    rows = []
+    for date in calendar:
+        for rank, symbol in enumerate(("B.SZ", "A.SH", "C.BJ"), start=1):
+            rows.append(
+                {"trade_date": date, "symbol": symbol, "NeuralRank": rank}
+            )
+    predictions = pd.DataFrame(rows)
+    config = _test_config(top_k=2, rebalance_every=2)
+
+    reference = {}
+    for position, signal_date in enumerate(calendar[:-1]):
+        if position % config.rebalance_every:
+            continue
+        ranked = predictions[predictions["trade_date"].eq(signal_date)].sort_values(
+            "NeuralRank"
+        )
+        reference[pd.Timestamp(calendar[position + 1])] = ranked.head(
+            config.top_k
+        )["symbol"].tolist()
+
+    assert prepare_signal_targets(predictions, calendar, config) == reference

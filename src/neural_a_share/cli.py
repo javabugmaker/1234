@@ -38,6 +38,11 @@ def build_parser() -> argparse.ArgumentParser:
     walk = sub.add_parser("walk-forward", help="expanding purged walk-forward")
     walk.add_argument("--max-folds", type=int)
     walk.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="recompute selected folds instead of reusing matching completed folds",
+    )
+    walk.add_argument(
         "--allow-degraded-survivorship",
         action="store_true",
         help="keep cached historical rows and mark every OOS artifact DEGRADED",
@@ -74,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         pipeline.walk_forward(
             max_folds=args.max_folds,
             allow_degraded_survivorship=args.allow_degraded_survivorship,
+            resume=not args.no_resume,
         )
     elif args.command == "backtest":
         pipeline.run_backtest()

@@ -142,3 +142,31 @@ def test_partition_one_to_one_validation_rejects_duplicate_keys(tmp_path) -> Non
     loader = PartitionedResearchLoader(store, FEATURE_NAMES, (20, 40, 60))
     with pytest.raises(ValueError, match="one-to-one"):
         loader.scan(mature_cutoff=pd.Timestamp("2025-12-31"))
+
+
+def test_merged_annual_research_cache_avoids_repeated_feature_label_merge(
+    tmp_path, monkeypatch
+) -> None:
+    store = ParquetStore(tmp_path / "cache")
+    _write_partition(store, 2024, days=12, symbols=25)
+    loader = PartitionedResearchLoader(store, FEATURE_NAMES, (20, 40, 60))
+    labels = ("label_20", "label_40", "label_60")
+
+    first = loader.read_partition(2024, FEATURE_NAMES, labels)
+    cache_path = (
+        store.derived_dir
+        / "research_cache"
+        / "year=2024"
+        / "research.parquet"
+    )
+    assert cache_path.exists()
+
+    def forbidden_source_read(*args, **kwargs):
+        raise AssertionError("a valid merged annual cache must bypass both source files")
+
+    monkeypatch.setattr(store, "read_derived_year", forbidden_source_read)
+    second = loader.read_partition(2024, FEATURE_NAMES, labels)
+
+    pd.testing.assert_frame_equal(first, second)
+    assert all(second[name].dtype == np.dtype("float32") for name in FEATURE_NAMES)
+    assert all(second[name].dtype == np.dtype("float32") for name in labels)

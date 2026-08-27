@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gc
 import json
 import logging
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -9,7 +11,7 @@ from typing import Any, Callable, Iterable, Sequence
 import numpy as np
 import pandas as pd
 
-from .backtest import BacktestResult, PortfolioBacktester
+from .backtest import BacktestResult, PortfolioBacktester, prepare_signal_targets
 from .config import AppConfig
 from .data.pit import audit_survivorship, reconstruct_pit_prices
 from .data.quality import DataQualityReport, assert_complete, check_bars
@@ -33,6 +35,13 @@ from .model import (
 from .reports import ReportContext, StaticReportPublisher, write_status_json
 from .research import PartitionedResearchLoader, ResearchSplitSpec
 from .walk_forward import PurgedWalkForward, WalkForwardFold
+from .walk_forward_cache import (
+    WALK_FORWARD_CACHE_VERSION,
+    WalkForwardFoldCache,
+    WalkForwardRunResult,
+    file_inventory,
+    stable_digest,
+)
 
 LOGGER = logging.getLogger("neural_a_share")
 ProgressCallback = Callable[[str, float | None], None]
@@ -155,6 +164,7 @@ class NeuralAlphaPipeline:
             row_filter=lambda frame: self._apply_observed_membership(
                 frame, strict=strict_membership
             ),
+            cache_progress=lambda message: self.emit(message, None),
         )
 
     def _apply_observed_membership(self, frame: pd.DataFrame, strict: bool = True) -> pd.DataFrame:
@@ -194,6 +204,7 @@ class NeuralAlphaPipeline:
         model_version: str,
         training_cutoff: pd.Timestamp,
         survivorship_status: str = "PASS",
+        training_progress: Callable[[int, int, float, float], None] | None = None,
     ) -> tuple[MultiTaskMLP, FeatureNormalizer, CheckpointMetadata, Any]:
         label_columns = [f"label_{h}" for h in self.config.labels.horizons]
         train = train.dropna(subset=label_columns, how="all")
@@ -219,7 +230,12 @@ class NeuralAlphaPipeline:
             horizons=self.config.labels.horizons,
         )
         training_result = NeuralTrainer(self.config.model).fit(
-            model, train_x, train_y, validation_x, validation_y
+            model,
+            train_x,
+            train_y,
+            validation_x,
+            validation_y,
+            progress=training_progress,
         )
         del train_x, train_y, validation_y
         output = predict_array(model, validation_x, self.config.model.device)
@@ -295,12 +311,27 @@ class NeuralAlphaPipeline:
             f"Training {version} on {len(train):,} rows; validation {len(validation):,}",
             0.05,
         )
+
+        def training_progress(
+            epoch: int,
+            total: int,
+            train_loss: float,
+            validation_loss: float,
+        ) -> None:
+            if epoch == 1 or epoch % 5 == 0 or epoch == total:
+                self.emit(
+                    f"Epoch {epoch}/{total} · train {train_loss:.6f} · "
+                    f"validation {validation_loss:.6f}",
+                    0.05 + 0.90 * epoch / max(total, 1),
+                )
+
         model, normalizer, metadata, result = self._fit_one(
             train,
             validation,
             version,
             latest,
             survivorship_status=survivorship_status,
+            training_progress=training_progress,
         )
         checkpoint = self.config.paths.models_dir / version / "checkpoint.pt"
         save_checkpoint(checkpoint, model, normalizer, metadata, result)
@@ -330,11 +361,53 @@ class NeuralAlphaPipeline:
         self.emit(f"Model saved as {role}: {version}", 1.0)
         return metadata
 
+    def _walk_forward_fold_signature(
+        self,
+        fold: WalkForwardFold,
+        survivorship_status: str,
+    ) -> str:
+        dates = fold.train_dates.append(fold.validation_dates).append(fold.test_dates)
+        years = sorted(set(int(year) for year in dates.year))
+        source_files = []
+        for name in ("features", "labels"):
+            for year in years:
+                path = (
+                    self.store.derived_dir
+                    / name
+                    / f"year={year}"
+                    / f"{name}.parquet"
+                )
+                if path.exists():
+                    source_files.append(path)
+        if survivorship_status == "PASS":
+            for path in self.store.universe_dir.glob("asof=*.parquet"):
+                snapshot_date = pd.Timestamp(path.stem.split("=", 1)[1])
+                if snapshot_date <= fold.test_dates[-1]:
+                    source_files.append(path)
+        return stable_digest(
+            {
+                "cache_version": WALK_FORWARD_CACHE_VERSION,
+                "fold": fold.as_dict(),
+                "calendar": [int(value) for value in dates.asi8],
+                "feature_names": FEATURE_NAMES,
+                "horizons": self.config.labels.horizons,
+                "model": asdict(self.config.model),
+                "walk_forward": asdict(self.config.walk_forward),
+                "survivorship_status": survivorship_status,
+                "sources": file_inventory(
+                    source_files, relative_to=self.config.paths.cache_dir
+                ),
+            }
+        )
+
     def walk_forward(
         self,
         max_folds: int | None = None,
         allow_degraded_survivorship: bool = False,
-    ) -> pd.DataFrame:
+        resume: bool = True,
+    ) -> WalkForwardRunResult:
+        if max_folds is not None and int(max_folds) <= 0:
+            raise ValueError("max_folds must be positive")
         strict_membership = (
             self.config.data.strict_survivorship and not allow_degraded_survivorship
         )
@@ -360,13 +433,47 @@ class NeuralAlphaPipeline:
         splitter = PurgedWalkForward(
             self.config.walk_forward, max_label_horizon=max(self.config.labels.horizons)
         )
-        folds = list(splitter.split(dates))
+        all_folds = list(splitter.split(dates))
+        if not all_folds:
+            raise ValueError("not enough benchmark sessions for walk-forward")
+        folds = all_folds
         if max_folds is not None:
             folds = folds[-int(max_folds) :]
-        predictions: list[pd.DataFrame] = []
+        coverage_status = "FULL" if len(folds) == len(all_folds) else "PARTIAL"
+        cache = WalkForwardFoldCache(
+            self.config.paths.backtests_dir / "walk_forward_cache"
+        )
+        artifacts: list[tuple[int, str]] = []
         fold_rows: list[dict[str, Any]] = []
+        cached_folds = 0
+        run_started = time.perf_counter()
+        self.emit(
+            f"Walk Forward {coverage_status} · selected {len(folds)}/{len(all_folds)} folds · "
+            f"resume {'ON' if resume else 'OFF'}",
+            0.02,
+        )
         for number, fold in enumerate(folds, start=1):
-            self.emit(f"Walk-forward fold {fold.fold_id} ({number}/{len(folds)})", (number - 1) / len(folds))
+            signature = self._walk_forward_fold_signature(
+                fold, survivorship_status
+            )
+            artifacts.append((fold.fold_id, signature))
+            fold_started = time.perf_counter()
+            if resume:
+                cached_row = cache.fold_row(fold.fold_id, signature)
+                if cached_row is not None:
+                    cached_folds += 1
+                    cached_row["cache_status"] = "REUSED"
+                    fold_rows.append(cached_row)
+                    self.emit(
+                        f"Fold {fold.fold_id} ({number}/{len(folds)}) reused from cache",
+                        0.02 + 0.94 * number / len(folds),
+                    )
+                    continue
+
+            self.emit(
+                f"Fold {fold.fold_id} ({number}/{len(folds)}) preparing bounded partitions",
+                0.02 + 0.94 * (number - 1) / len(folds),
+            )
             prepared = loader.load_splits(
                 index,
                 {
@@ -396,12 +503,33 @@ class NeuralAlphaPipeline:
             version = f"wf-{fold.fold_id}-{fold.test_dates[0].date()}"
             if survivorship_status == "DEGRADED":
                 version = f"{version}-degraded"
-            model, normalizer, _, _ = self._fit_one(
+
+            def training_progress(
+                epoch: int,
+                total: int,
+                train_loss: float,
+                validation_loss: float,
+            ) -> None:
+                fold_fraction = min(epoch / max(total, 1), 1.0)
+                if epoch == 1 or epoch % 5 == 0 or epoch == total:
+                    elapsed = time.perf_counter() - fold_started
+                    self.emit(
+                        f"Fold {fold.fold_id} epoch {epoch}/{total} · "
+                        f"train {train_loss:.6f} · validation {validation_loss:.6f} · "
+                        f"elapsed {elapsed / 60:.1f}m",
+                        0.02
+                        + 0.94
+                        * ((number - 1) + 0.12 + 0.76 * fold_fraction)
+                        / len(folds),
+                    )
+
+            model, normalizer, _, training_result = self._fit_one(
                 train,
                 validation,
                 version,
                 fold.training_cutoff,
                 survivorship_status=survivorship_status,
+                training_progress=training_progress,
             )
             test_features = test.dropna(subset=FEATURE_NAMES, how="all").copy()
             scored = inference_frame(
@@ -413,42 +541,105 @@ class NeuralAlphaPipeline:
             )
             scored["fold_id"] = fold.fold_id
             scored["sample_zone"] = sample_zone
-            predictions.append(scored)
             fold_row = fold.as_dict()
             fold_row["survivorship_status"] = survivorship_status
             fold_row["sample_zone"] = sample_zone
+            fold_row["cache_status"] = "COMPUTED"
+            fold_row["prediction_rows"] = len(scored)
+            fold_row["epochs_trained"] = training_result.epochs_trained
+            fold_row["best_validation_loss"] = (
+                training_result.best_validation_loss
+            )
+            fold_row["duration_seconds"] = time.perf_counter() - fold_started
+            cache.save(fold.fold_id, signature, scored, fold_row)
             fold_rows.append(fold_row)
-        output = pd.concat(predictions, ignore_index=True) if predictions else pd.DataFrame()
+            del prepared, train, validation, test, test_features
+            del model, normalizer, scored, training_result
+            gc.collect()
+            elapsed = time.perf_counter() - run_started
+            average = elapsed / max(number - cached_folds, 1)
+            remaining_uncached = max(len(folds) - number, 0)
+            self.emit(
+                f"Fold {fold.fold_id} persisted · estimated remaining "
+                f"{average * remaining_uncached / 60:.1f}m",
+                0.02 + 0.94 * number / len(folds),
+            )
+
         destination = self.config.paths.backtests_dir / "walk_forward_predictions.parquet"
-        ParquetStore._atomic_parquet(output, destination)
-        pd.DataFrame(fold_rows).to_csv(
-            self.config.paths.backtests_dir / "walk_forward_folds.csv", index=False
+        prediction_rows = cache.publish(
+            artifacts, destination, coverage_status=coverage_status
+        )
+        ParquetStore._atomic_csv(
+            pd.DataFrame(fold_rows),
+            self.config.paths.backtests_dir / "walk_forward_folds.csv",
         )
         self.store.write_manifest(
             "walk_forward",
             {
                 "survivorship_status": survivorship_status,
                 "sample_zone": sample_zone,
-                "folds": len(fold_rows),
-                "predictions": len(output),
+                "coverage_status": coverage_status,
+                "folds": len(folds),
+                "selected_folds": len(folds),
+                "total_folds": len(all_folds),
+                "cached_folds": cached_folds,
+                "resume_enabled": bool(resume),
+                "cache_version": WALK_FORWARD_CACHE_VERSION,
+                "predictions": prediction_rows,
             },
         )
-        self.emit(f"{sample_zone} predictions: {len(output):,}", 1.0)
-        return output
+        self.emit(
+            f"{sample_zone} {coverage_status} predictions: {prediction_rows:,} · "
+            f"cache hits {cached_folds}/{len(folds)}",
+            1.0,
+        )
+        return WalkForwardRunResult(
+            predictions_path=destination,
+            selected_folds=len(folds),
+            total_folds=len(all_folds),
+            predictions=prediction_rows,
+            cached_folds=cached_folds,
+            coverage_status=coverage_status,
+            sample_zone=sample_zone,
+        )
 
     def run_backtest(self) -> BacktestResult:
         prediction_path = self.config.paths.backtests_dir / "walk_forward_predictions.parquet"
         if not prediction_path.exists():
             raise FileNotFoundError("walk-forward predictions missing")
-        predictions = pd.read_parquet(prediction_path)
+        predictions = pd.read_parquet(
+            prediction_path,
+            columns=["symbol", "trade_date", "NeuralRank", "NeuralAlpha"],
+        )
         start = pd.to_datetime(predictions["trade_date"]).min() - pd.Timedelta(days=7)
-        bars = self.store.read_bars(start_date=start)
+        benchmark_bars = self.store.read_bars(
+            start_date=start, symbols=[self.config.tickflow.benchmark]
+        )
+        calendar = pd.DatetimeIndex(
+            pd.to_datetime(benchmark_bars["trade_date"])
+            .drop_duplicates()
+            .sort_values()
+        )
+        targets = prepare_signal_targets(
+            predictions, calendar, self.config.portfolio
+        )
+        needed_symbols = {self.config.tickflow.benchmark}
+        needed_symbols.update(
+            symbol for symbols in targets.values() for symbol in symbols
+        )
+        bars = self.store.read_bars(
+            start_date=start, symbols=sorted(needed_symbols)
+        )
         snapshot_dates = self.store.universe_snapshot_dates()
         metadata = (
             self.store.read_universe_asof(snapshot_dates[-1], strict=True) if snapshot_dates else pd.DataFrame()
         )
         result = PortfolioBacktester(self.config.portfolio).run(
-            bars, predictions, metadata, benchmark=self.config.tickflow.benchmark
+            bars,
+            predictions,
+            metadata,
+            benchmark=self.config.tickflow.benchmark,
+            prepared_targets=targets,
         )
         for name, frame in {
             "nav": result.nav,
@@ -576,6 +767,10 @@ class NeuralAlphaPipeline:
         rolling = pd.DataFrame()
         quantiles = pd.DataFrame()
         research: dict[str, Any] = {}
+        walk_forward = self.store.read_manifest("walk_forward")
+        coverage_status = str(
+            walk_forward.get("coverage_status", "FULL")
+        ).upper()
         if oos_path.exists() and self.store.derived_years("labels"):
             oos = pd.read_parquet(oos_path)
             oos["trade_date"] = pd.to_datetime(oos["trade_date"]).dt.normalize()
@@ -639,7 +834,11 @@ class NeuralAlphaPipeline:
         if fold_path.exists():
             folds = pd.read_csv(fold_path)
             research["test_period"] = f"{folds['test_start'].min()} — {folds['test_end'].max()}"
-            research["split_summary"] = f"{len(folds)} expanding folds"
+            selected = int(walk_forward.get("selected_folds", len(folds)))
+            total = int(walk_forward.get("total_folds", selected))
+            research["split_summary"] = (
+                f"{selected}/{total} expanding folds · {coverage_status}"
+            )
         research.update(
             {
                 "in_sample_status": (
@@ -664,7 +863,6 @@ class NeuralAlphaPipeline:
             pit = reconstruct_pit_prices(bars)
             benchmark_nav = pit[["trade_date", "pit_close"]].rename(columns={"pit_close": "nav"})
         audit = audit_survivorship(self.store.universe_snapshot_dates(), nav["trade_date"].min() if not nav.empty else None)
-        walk_forward = self.store.read_manifest("walk_forward")
         declared_statuses = {
             audit.status,
             training.get("survivorship_status"),
@@ -676,11 +874,14 @@ class NeuralAlphaPipeline:
             survivorship_status = "FAIL"
         else:
             survivorship_status = "PASS"
-        if (
-            research.get("historical_oos_status") == "PASS"
-            and survivorship_status != "PASS"
-        ):
-            research["historical_oos_status"] = survivorship_status
+        historical_status = str(
+            research.get("historical_oos_status", survivorship_status)
+        )
+        if survivorship_status != "PASS" and survivorship_status not in historical_status:
+            historical_status = survivorship_status
+        if coverage_status != "FULL" and "PARTIAL" not in historical_status:
+            historical_status = f"{historical_status} / PARTIAL"
+        research["historical_oos_status"] = historical_status
         quality_dict = quality.to_dict()
         quality_dict.update(
             {"pit_status": "PASS", "survivorship_status": survivorship_status}

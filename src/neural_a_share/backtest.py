@@ -143,6 +143,35 @@ def performance_metrics(nav: pd.DataFrame) -> dict[str, float]:
     }
 
 
+def prepare_signal_targets(
+    predictions: pd.DataFrame,
+    calendar: pd.DatetimeIndex,
+    config: PortfolioConfig,
+) -> dict[pd.Timestamp, list[str]]:
+    """Vectorize signal-date ranking and map it to the next tradable session."""
+
+    if predictions.empty or len(calendar) < 2:
+        return {}
+    frame = predictions[["symbol", "trade_date", "NeuralRank"]].copy()
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"]).dt.normalize()
+    positions = pd.Series(np.arange(len(calendar), dtype="int64"), index=calendar)
+    frame["_calendar_position"] = frame["trade_date"].map(positions)
+    eligible = frame["_calendar_position"].notna()
+    eligible &= frame["_calendar_position"].lt(len(calendar) - 1)
+    eligible &= frame["_calendar_position"].mod(
+        int(config.rebalance_every)
+    ).eq(0)
+    ranked = frame.loc[eligible].sort_values(
+        ["trade_date", "NeuralRank", "symbol"]
+    )
+    top = ranked.groupby("trade_date", sort=False).head(int(config.top_k))
+    targets: dict[pd.Timestamp, list[str]] = {}
+    for _, group in top.groupby("trade_date", sort=False):
+        position = int(group["_calendar_position"].iloc[0])
+        targets[pd.Timestamp(calendar[position + 1])] = group["symbol"].tolist()
+    return targets
+
+
 class PortfolioBacktester:
     """Event-driven long-only backtester.
 
@@ -160,6 +189,7 @@ class PortfolioBacktester:
         predictions: pd.DataFrame,
         metadata: pd.DataFrame | None = None,
         benchmark: str = "000300.SH",
+        prepared_targets: Mapping[pd.Timestamp, list[str]] | None = None,
     ) -> BacktestResult:
         required_predictions = {"symbol", "trade_date", "NeuralRank", "NeuralAlpha"}
         if missing := required_predictions - set(predictions):
@@ -169,13 +199,25 @@ class PortfolioBacktester:
         market = market.sort_values(["trade_date", "symbol"]).drop_duplicates(
             ["trade_date", "symbol"], keep="last"
         )
-        prediction_frame = predictions.copy()
-        prediction_frame["trade_date"] = pd.to_datetime(prediction_frame["trade_date"]).dt.normalize()
         calendar = pd.DatetimeIndex(
             market.loc[market["symbol"].eq(benchmark), "trade_date"].drop_duplicates().sort_values()
         )
         if len(calendar) < 2:
             raise ValueError("benchmark calendar is missing or too short")
+        if prepared_targets is None:
+            signal_targets = prepare_signal_targets(
+                predictions, calendar, self.config
+            )
+        else:
+            signal_targets = {
+                pd.Timestamp(date).normalize(): list(symbols)
+                for date, symbols in prepared_targets.items()
+            }
+        needed_symbols = {benchmark}
+        needed_symbols.update(
+            symbol for symbols in signal_targets.values() for symbol in symbols
+        )
+        market = market[market["symbol"].isin(needed_symbols)]
         price_lookup = {
             (pd.Timestamp(row.trade_date), row.symbol): row._asdict()
             for row in market.itertuples(index=False)
@@ -185,16 +227,6 @@ class PortfolioBacktester:
             column = "instrument_type" if "instrument_type" in metadata else "type"
             if column in metadata:
                 type_lookup = dict(zip(metadata["symbol"], metadata[column].fillna("stock")))
-        signal_targets: dict[pd.Timestamp, list[str]] = {}
-        signal_dates = set(prediction_frame["trade_date"])
-        for index, date in enumerate(calendar[:-1]):
-            if date not in signal_dates or index % int(self.config.rebalance_every) != 0:
-                continue
-            ranked = prediction_frame[prediction_frame["trade_date"].eq(date)].sort_values(
-                ["NeuralRank", "symbol"]
-            )
-            target = ranked.head(int(self.config.top_k))["symbol"].tolist()
-            signal_targets[calendar[index + 1]] = target
 
         cash = float(self.config.initial_cash)
         positions: dict[str, Position] = {}
