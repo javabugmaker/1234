@@ -1,0 +1,89 @@
+paths:
+  data_root: data
+  cache_dir: data/cache
+  models_dir: data/models
+  predictions_dir: data/predictions
+  backtests_dir: data/backtests
+  logs_dir: data/logs
+  docs_dir: docs
+
+tickflow:
+  service: free
+  exchanges: [SH, SZ, BJ]
+  instrument_types: [stock, etf, fund]
+  benchmark: 000300.SH
+  batch_size: 100
+  max_workers: 2
+  timeout_seconds: 45
+  max_retries: 4
+  history_start: "2005-01-01"
+  period: 1d
+  adjust: none
+
+data:
+  strict_pit: true
+  strict_survivorship: true
+  max_staleness_trading_days: 1
+  min_history_days: 260
+  universe_snapshot_hour_cst: 15
+
+features:
+  winsor_lower: 0.01
+  winsor_upper: 0.99
+  min_cross_section: 20
+  max_lookback: 240
+
+labels:
+  horizons: [20, 40, 60]
+  benchmark: 000300.SH
+  cross_sectional_standardize: false
+
+walk_forward:
+  initial_train_days: 756
+  validation_days: 126
+  test_days: 63
+  step_days: 63
+  purge_days: 60
+  embargo_days: 5
+
+model:
+  hidden_dims: [128, 64, 32]
+  dropout: 0.15
+  batch_size: 4096
+  epochs: 80
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  huber_delta: 0.02
+  patience: 10
+  min_delta: 0.000001
+  gradient_clip_norm: 1.0
+  device: auto
+  num_workers: 0
+  seed: 20260827
+  max_train_rows: 2500000
+  max_validation_rows: 500000
+
+portfolio:
+  top_k: 30
+  rebalance_every: 5
+  initial_cash: 1000000.0
+  max_holding_days: 60
+  lot_size: 100
+  max_weight: 0.05
+  max_participation: 0.05
+  fixed_slippage_bps: 5.0
+  impact_coefficient: 0.10
+  impact_exponent: 0.5
+  max_impact_bps: 30.0
+  stock_commission_buy: 0.00008499999
+  stock_commission_sell: 0.00008499999
+  fund_commission_buy: 0.00005000001
+  fund_commission_sell: 0.00005000001
+  stock_stamp_duty_sell: 0.0005
+  minimum_commission: 0.0
+  max_exit_deferral_days: 10
+
+reports:
+  title: TickFlow Neural Alpha
+  timezone: Asia/Shanghai
+  rolling_ic_window: 63

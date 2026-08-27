@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install CPU PyTorch
+        run: python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.3,<3"
+      - name: Install project
+        run: python -m pip install -e ".[dev]"
+      - name: Compile
+        run: python -m compileall -q src tests run_*.py
+      - name: Tests
+        run: python -m pytest -q
+      - name: Validate Pages artifact
+        run: python scripts/validate_pages.py docs
