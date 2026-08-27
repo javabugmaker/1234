@@ -1,6 +1,6 @@
 # TickFlow Neural Alpha
 
-一个从零实现的 A 股/ETF 纯神经网络选股研究项目。数据只来自官方 `TickFlow.free()` Python SDK；项目不需要 API Key，不接入其他行情源，也不继承任何旧项目的 RuleScore、InstitutionalScore 或人工打分。
+一个从零实现的 A 股股票纯神经网络选股研究项目。数据只来自官方 `TickFlow.free()` Python SDK；项目不需要 API Key，不接入其他行情源，也不继承任何旧项目的 RuleScore、InstitutionalScore 或人工打分。TickFlow 缓存可以保留 ETF/基金行情供市场特征与交易成本研究使用，但默认候选池只允许 A 股股票。
 
 模型唯一的选股链路是：
 
@@ -10,7 +10,7 @@
   → Alpha20 / Alpha40 / Alpha60
   → NeuralAlpha = mean(three neural heads)
   → NeuralRank
-  → Top-K
+  → Neural Stock Top-K
 ```
 
 RSI、MACD、CMF、OBV、ATR、Momentum、Volume 和 Volatility 只作为网络输入。任何技术指标都不会绕过模型直接改变排名。
@@ -21,6 +21,7 @@ RSI、MACD、CMF、OBV、ATR、Momentum、Volume 和 Volatility 只作为网络�
 - 缓存：原始数据按年写入原子 Parquet 分区；日更自动覆盖重叠窗口并去重。
 - 复权/PIT：只存 `adjust="none"`；利用每个交易日当时可见的 `prev_close` 构造收益链，不把今天的前复权序列倒灌到过去。
 - 特征：122 个仅依赖 `t` 日及以前数据的量价特征，当日横截面缩尾标准化。
+- 候选资格：使用信号日已经观察到的 TickFlow `instrument_type` 收口为股票，并要求默认至少 80% Feature 可用；这两个条件只决定网络可推理的研究范围，不产生分数，也不改变范围内的 NeuralRank。
 - 标签：信号在 `t` 日收盘生成，标签从 `t+1` 开盘到 `t+h` 收盘；缺失开盘、停牌或未成熟标签不会被评价。
 - 划分：Expanding Purged Walk-Forward；没有 random split，Train/Validation 与 Validation/Test 之间都隔离最长 60 日标签区间，另加 embargo。
 - 调参：Early Stopping 只看 Validation；Test 只产生 Historical OOS 预测，不参与模型选择。
@@ -93,7 +94,8 @@ py -3.11 -m venv .venv
 Walk Forward 默认启用逐折断点续跑。输入数据、折边界、Feature、模型配置或
 Survivorship 模式的签名没有变化时，已完成折会直接复用；需要强制重算所选折时添加
 `--no-resume`。`--max-folds 2` 只发布最近两折并明确标为 `PARTIAL`，不能当成完整
-Historical OOS；不传 `--max-folds` 才发布全部可用折。
+Historical OOS；不传 `--max-folds` 才发布全部可用折。Walk Forward 折只用于历史
+OOS 评价与回测，不会替代 Champion，也不会直接生成 DAILY 榜单。
 
 该开关不会改变 Feature、Label、日期切分、Purge/Embargo 或训练抽样，只跳过无法由免费服务追溯证明的历史 membership 过滤。它不能消除现有历史缓存可能包含的 Survivorship Bias；严格模式仍会 fail-closed，且不会自动降级。
 
@@ -104,6 +106,7 @@ Historical OOS；不传 `--max-folds` 才发布全部可用折。
 .\.venv\Scripts\python.exe run_train.py
 .\.venv\Scripts\python.exe run_backtest.py
 .\.venv\Scripts\python.exe run_weekly.py
+.\.venv\Scripts\python.exe run_publish_pages.py
 ```
 
 ## 16 GB 内存训练
@@ -129,11 +132,14 @@ TickFlow.free() 增量日 K
 → schema / OHLC / 重复 / 日历 / 完整性 / 新鲜度检查
 → 当前年份 Feature/Label 分区更新
 → 加载 champion checkpoint
-→ 全市场 MLP 推理
+→ 全市场因果 Feature
+→ PIT 股票类别 + Feature 完整度资格过滤
+→ Champion MLP 推理
 → Alpha20 / Alpha40 / Alpha60
 → NeuralAlpha / NeuralRank / Top-K
 → predictions/YYYY-MM-DD.{parquet,csv}
-→ docs/index.html + daily.html + 历史归档
+→ docs/index.html + daily.html + publish.html + 历史归档
+→ 完整站点校验后安全自动推送 docs/（失败不影响 DAILY，也不覆盖健康站点）
 ```
 
 免费服务盘中不会实时更新。GUI 和页面显示的是 TickFlow 已提供的最近一根完整日 K，绝不会把实时快照伪装成收盘数据。
@@ -176,6 +182,34 @@ fail-closed；开启时保留历史缓存样本，并把模型和 Walk-Forward �
 `DEGRADED`，不会改变日期切分、Purge/Embargo 或统计口径。
 快速范围的产物同时标记 `PARTIAL`；要生成完整历史 OOS 报告，请选择“全部折（完整范围）”。
 
+GUI 的 Walk Forward 范围旁会明确显示“仅历史 OOS 评估”，并提供独立的
+“发布 Pages”后台按钮。榜单只显示股票；`FeatureCoverage` 会同时写入预测文件、
+日报和首页，方便审计候选资格。
+
+## Pages 自动发布
+
+`docs/publish.html` 是独立的发布状态页。默认配置 `reports.auto_push_pages: true`，
+因此 DAILY 和 WEEKLY 在本地四个核心页面、历史归档和图表全部生成并校验后，会自动
+尝试推送。也可单独执行：
+
+```powershell
+.\.venv\Scripts\neural-alpha.exe publish-pages
+# 或
+.\.venv\Scripts\python.exe run_publish_pages.py
+```
+
+发布器使用临时 Git index，把本地 `docs/` 叠加到最新远端 `main` 后做非强制推送；
+不会切换当前分支，不会修改源代码工作区，也不会碰已有 staged changes。远端并发更新、
+身份认证、分支保护、CI 或部署失败时安全停止，线上继续保留上一版健康页面，DAILY/WEEKLY
+本身仍算成功。Windows 需要当前仓库的 Git 凭据能够正常执行 `git push origin main`；
+若只需要本地报告，可把 `auto_push_pages` 设为 `false`，以后再用 GUI/CLI 手动重试。
+
+从旧版本升级不需要重新下载 TickFlow，也不需要 `update --full`。当前 Champion 会立即只在
+合格股票中推理；要让训练样本也完全收口为股票，请重新执行训练，并在模型管理中审阅后
+Promote 新 Challenger。Walk Forward 的缓存签名包含股票范围和完整度阈值，旧 ETF 范围的
+折不会被误复用。收益好坏必须用足够长的 Historical OOS 或后续 Forward Shadow OOS 判断；
+最近 2 折只适合快速验证管线，不能据此调整统计口径。
+
 ## 测试
 
 ```powershell
@@ -184,7 +218,8 @@ fail-closed；开启时保留历史缓存样本，并把模型和 Walk-Forward �
 
 测试覆盖 PIT、标签对齐与成熟度、Purge、Expanding Walk-Forward、逐折缓存/断点续跑、
 年度研究缓存、向量批处理、checkpoint、CUDA/CPU fallback、Rank IC、T+1、股票/ETF
-成本、退出顺延、Position Ledger、NAV 和 TickFlow 完整性。
+成本、退出顺延、Position Ledger、NAV、股票候选资格、Feature 覆盖率、Pages 临时 index
+安全推送和 TickFlow 完整性。
 
 ## 目录
 

@@ -26,6 +26,7 @@ data:
   max_staleness_trading_days: 1
   min_history_days: 260
   universe_snapshot_hour_cst: 15
+  min_feature_coverage: 0.80
 
 features:
   winsor_lower: 0.01
@@ -64,6 +65,7 @@ model:
   max_validation_rows: 500000
 
 portfolio:
+  selection_instrument_types: [stock]
   top_k: 30
   rebalance_every: 5
   initial_cash: 1000000.0
@@ -87,3 +89,6 @@ reports:
   title: TickFlow Neural Alpha
   timezone: Asia/Shanghai
   rolling_ic_window: 63
+  auto_push_pages: true
+  pages_remote: origin
+  pages_branch: main

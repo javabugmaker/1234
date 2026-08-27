@@ -146,7 +146,7 @@ class NeuralAlphaApp:
         )
         self.ttk.Label(
             mode_bar,
-            text="WF 范围（自动断点续跑）",
+            text="WF 范围（仅历史 OOS 评估）",
             foreground="#8fa5bd",
         ).pack(side="right", padx=(12, 6))
         self.walk_forward_scope = self.ttk.Combobox(
@@ -174,6 +174,7 @@ class NeuralAlphaApp:
             ("回测", lambda: self._pipeline().run_backtest()),
             ("日报", lambda: self._pipeline().daily(True)),
             ("周报", lambda: self._pipeline().weekly()),
+            ("发布 Pages", lambda: self._pipeline().publish_pages()),
             ("模型管理", self._show_models),
         ]
         for label, callback in actions:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ a{color:var(--cyan);text-decoration:none}.wrap{max-width:1320px;margin:auto;padd
 .badge{display:inline-flex;border-radius:999px;padding:4px 9px;font-size:11px;font-weight:700;border:1px solid}.pass{color:var(--green);border-color:#286d58;background:#11362e}.warn{color:var(--amber);border-color:#745b26;background:#382d15}.fail{color:var(--red);border-color:#783647;background:#391925}.info{color:var(--cyan);border-color:#27617a;background:#102f41}
 table{width:100%;border-collapse:collapse;margin-top:8px}th,td{text-align:right;padding:9px 10px;border-bottom:1px solid var(--line);white-space:nowrap}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}th{color:var(--muted);font-size:11px;text-transform:uppercase;position:sticky;top:0;background:var(--panel)}.table-wrap{overflow:auto;max-height:680px}.two{grid-template-columns:repeat(auto-fit,minmax(420px,1fr))}.chart{width:100%;min-height:280px;border-radius:8px;background:#081522}.nav{display:flex;gap:14px;flex-wrap:wrap;margin:12px 0 0}.section-title{font-size:18px;margin:0 0 12px}.zones{grid-template-columns:repeat(4,1fr)}.zone{border-left:3px solid var(--cyan)}.footer{color:var(--muted);font-size:12px;padding:24px 0;text-align:center}@media(max-width:800px){.wrap{padding:16px}.hero{display:block}.two,.zones{grid-template-columns:1fr}.chart{min-height:220px}}
 """
+LOCAL_ASSET_REFERENCE = re.compile(r'''(?:src|href)=["'](assets/[^"']+)["']''')
 
 
 def _fmt(value: Any, percent: bool = False, digits: int = 2) -> str:
@@ -44,7 +46,12 @@ def _badge(value: str) -> str:
 
 
 def _page(title: str, data_date: str, body: str, active: str) -> str:
-    links = [("首页", "index.html", "index"), ("日报", "daily.html", "daily"), ("周报", "weekly.html", "weekly")]
+    links = [
+        ("首页", "index.html", "index"),
+        ("日报", "daily.html", "daily"),
+        ("周报", "weekly.html", "weekly"),
+        ("发布状态", "publish.html", "publish"),
+    ]
     navigation = "".join(
         f'<a class="badge {"info" if key == active else "warn"}" href="{href}">{label}</a>'
         for label, href, key in links
@@ -73,7 +80,11 @@ def _table(frame: pd.DataFrame, columns: list[tuple[str, str]], limit: int | Non
             if isinstance(value, float):
                 rendered = _fmt(
                     value,
-                    percent=key.lower().endswith("return") or key.startswith("Alpha") or key == "NeuralAlpha",
+                    percent=(
+                        key.lower().endswith("return")
+                        or key.startswith("Alpha")
+                        or key in {"NeuralAlpha", "FeatureCoverage"}
+                    ),
                 )
             else:
                 rendered = html.escape(str(value))
@@ -103,7 +114,15 @@ def chart_nav(nav: pd.DataFrame, benchmark_nav: pd.DataFrame | None, path: Path)
     axis.tick_params(colors="#8fa5bd")
     for spine in axis.spines.values():
         spine.set_color("#20364f")
-    axis.legend(facecolor="#0d1b2d", edgecolor="#20364f", labelcolor="#edf5ff")
+    handles, labels = axis.get_legend_handles_labels()
+    if handles:
+        axis.legend(
+            handles,
+            labels,
+            facecolor="#0d1b2d",
+            edgecolor="#20364f",
+            labelcolor="#edf5ff",
+        )
     axis.set_title("Strategy NAV vs CSI300", color="#edf5ff", loc="left", weight="bold")
     _save_chart(fig, path)
 
@@ -123,7 +142,15 @@ def chart_ic(rolling_ic: pd.DataFrame, path: Path) -> None:
     axis.tick_params(colors="#8fa5bd")
     for spine in axis.spines.values():
         spine.set_color("#20364f")
-    axis.legend(facecolor="#0d1b2d", edgecolor="#20364f", labelcolor="#edf5ff")
+    handles, labels = axis.get_legend_handles_labels()
+    if handles:
+        axis.legend(
+            handles,
+            labels,
+            facecolor="#0d1b2d",
+            edgecolor="#20364f",
+            labelcolor="#edf5ff",
+        )
     axis.set_title("Rolling Rank IC", color="#edf5ff", loc="left", weight="bold")
     _save_chart(fig, path)
 
@@ -173,21 +200,36 @@ class StaticReportPublisher:
             chart_ic(context.rolling_ic if context.rolling_ic is not None else pd.DataFrame(), assets / "rolling_ic.svg")
             chart_quantiles(context.quantiles if context.quantiles is not None else pd.DataFrame(), assets / "quantiles.svg")
             daily = self._daily(context)
-            if include_weekly or not (self.docs_dir / "weekly.html").exists():
+            existing_weekly = self.docs_dir / "weekly.html"
+            if include_weekly or not existing_weekly.exists():
                 weekly = self._weekly(context)
             else:
-                weekly = (self.docs_dir / "weekly.html").read_text(encoding="utf-8")
+                previous = existing_weekly.read_text(encoding="utf-8")
+                # A fresh clone can contain a short placeholder weekly page.
+                # DAILY must not fail because an unrelated old artifact is
+                # incomplete; safely regenerate it from the current context.
+                weekly = (
+                    previous
+                    if _valid_existing_document(previous, self.docs_dir)
+                    else self._weekly(context)
+                )
             index = self._index(context)
-            files = {"daily.html": daily, "weekly.html": weekly, "index.html": index}
+            publish_status = self._publish_status(context)
+            files = {
+                "daily.html": daily,
+                "weekly.html": weekly,
+                "index.html": index,
+                "publish.html": publish_status,
+            }
             for filename, content in files.items():
                 path = staging / filename
                 path.write_text(content, encoding="utf-8")
-                if len(content) < 800 or "</html>" not in content:
+                if not _valid_document(content):
                     raise ValueError(f"refusing to publish invalid {filename}")
             archive = staging / "reports" / context.data_date
             archive.mkdir(parents=True, exist_ok=True)
-            (archive / "daily.html").write_text(daily.replace('href="index.html"', 'href="../../index.html"').replace('href="daily.html"', 'href="../../daily.html"').replace('href="weekly.html"', 'href="../../weekly.html"'), encoding="utf-8")
-            (archive / "weekly.html").write_text(weekly.replace('href="index.html"', 'href="../../index.html"').replace('href="daily.html"', 'href="../../daily.html"').replace('href="weekly.html"', 'href="../../weekly.html"').replace('src="assets/', 'src="../../assets/'), encoding="utf-8")
+            (archive / "daily.html").write_text(daily.replace('href="index.html"', 'href="../../index.html"').replace('href="daily.html"', 'href="../../daily.html"').replace('href="weekly.html"', 'href="../../weekly.html"').replace('href="publish.html"', 'href="../../publish.html"'), encoding="utf-8")
+            (archive / "weekly.html").write_text(weekly.replace('href="index.html"', 'href="../../index.html"').replace('href="daily.html"', 'href="../../daily.html"').replace('href="weekly.html"', 'href="../../weekly.html"').replace('href="publish.html"', 'href="../../publish.html"').replace('src="assets/', 'src="../../assets/'), encoding="utf-8")
             self._commit_staging(staging, context.data_date, files.keys())
         finally:
             shutil.rmtree(staging, ignore_errors=True)
@@ -210,13 +252,21 @@ class StaticReportPublisher:
         (self.docs_dir / ".nojekyll").touch(exist_ok=True)
 
     def _daily(self, context: ReportContext) -> str:
-        latest = context.predictions.sort_values("NeuralRank").head(30) if context.predictions is not None else pd.DataFrame()
+        latest = (
+            context.predictions.sort_values("NeuralRank").head(30)
+            if context.predictions is not None
+            and "NeuralRank" in context.predictions
+            else pd.DataFrame()
+        )
+        research = dict(context.research or {})
         cards = _metrics_cards(
             [
                 ("TickFlow", context.tickflow_status, False),
                 ("Current Model", context.model_version, False),
                 ("Training Cutoff", context.training_cutoff, False),
-                ("Universe", len(context.predictions) if context.predictions is not None else 0, False),
+                ("Stock Universe", len(context.predictions) if context.predictions is not None else 0, False),
+                ("Signal Source", "Champion MLP", False),
+                ("Min Feature Coverage", research.get("min_feature_coverage", "N/A"), False),
             ]
         )
         table = _table(
@@ -229,9 +279,10 @@ class StaticReportPublisher:
                 ("Alpha40", "Alpha40"),
                 ("Alpha60", "Alpha60"),
                 ("NeuralAlpha", "NeuralAlpha"),
+                ("FeatureCoverage", "Feature Coverage"),
             ],
         )
-        body = cards + f'<section class="panel"><h2 class="section-title">Neural Top 30</h2><div class="small">100% 由多任务 MLP 输出；技术指标只作为输入特征。</div>{table}</section>'
+        body = cards + f'<section class="panel"><h2 class="section-title">Neural Stock Top 30</h2><div class="small">股票资格与数据完整度只决定可研究范围；范围内排序 100% 由 Champion 多任务 MLP 输出。Walk Forward folds 仅用于历史 OOS 评估，不直接产生本页每日排名。</div>{table}</section>'
         return _page(f"{self.title} · 日报", context.data_date, body, "daily")
 
     def _weekly(self, context: ReportContext) -> str:
@@ -270,6 +321,8 @@ class StaticReportPublisher:
                 ("Newey-West t 20 / 40 / 60", research.get("newey_west_t", "N/A")),
                 ("Yearly / Regime IC", research.get("yearly_regime_ic", "N/A")),
                 ("Top-K Performance", research.get("topk_performance", "N/A")),
+                ("Selection Universe", research.get("selection_universe", "N/A")),
+                ("Min Feature Coverage", research.get("min_feature_coverage", "N/A")),
                 ("IC Decay", research.get("ic_decay", "N/A")),
             ],
             columns=["item", "value"],
@@ -279,7 +332,13 @@ class StaticReportPublisher:
         return _page(f"{self.title} · 周报", context.data_date, body, "weekly")
 
     def _index(self, context: ReportContext) -> str:
-        latest = context.predictions.sort_values("NeuralRank").head(30) if context.predictions is not None else pd.DataFrame()
+        latest = (
+            context.predictions.sort_values("NeuralRank").head(30)
+            if context.predictions is not None
+            and "NeuralRank" in context.predictions
+            else pd.DataFrame()
+        )
+        research = dict(context.research or {})
         cards = _metrics_cards(
             [
                 ("最新数据", context.data_date, False),
@@ -296,9 +355,65 @@ class StaticReportPublisher:
         for date in sorted(report_dates, reverse=True)[:40]:
             history.append(f'<a class="badge info" href="reports/{date}/daily.html">{html.escape(date)}</a>')
         body = cards
-        body += f'<section class="panel"><h2 class="section-title">Neural Top 30</h2>{_table(latest, [("NeuralRank","Rank"),("symbol","Symbol"),("name","Name"),("Alpha20","Alpha20"),("Alpha40","Alpha40"),("Alpha60","Alpha60"),("NeuralAlpha","NeuralAlpha")])}</section>'
+        body += f'<section class="panel"><h2 class="section-title">Neural Stock Top 30</h2><div class="small">Signal Source: Champion MLP · Selection Universe: {html.escape(str(research.get("selection_universe", "N/A")))}</div>{_table(latest, [("NeuralRank","Rank"),("symbol","Symbol"),("name","Name"),("Alpha20","Alpha20"),("Alpha40","Alpha40"),("Alpha60","Alpha60"),("NeuralAlpha","NeuralAlpha"),("FeatureCoverage","Feature Coverage")])}</section>'
         body += f'<section class="panel"><h2 class="section-title">历史报告</h2><div class="nav">{"".join(history) or "<span class=muted>首份报告生成后显示</span>"}</div></section>'
         return _page(self.title, context.data_date, body, "index")
+
+    def _publish_status(self, context: ReportContext) -> str:
+        quality = dict(context.quality or {})
+        research = dict(context.research or {})
+        rows = pd.DataFrame(
+            [
+                ("Local page generation", "PASS"),
+                ("Core page validation", "PASS"),
+                ("Data cutoff", context.data_date),
+                ("Model", context.model_version),
+                ("Signal source", "Champion MLP"),
+                ("Selection universe", research.get("selection_universe", "N/A")),
+                ("PIT status", quality.get("pit_status", "N/A")),
+                (
+                    "GitHub publication",
+                    (
+                        "ENABLED after DAILY / WEEKLY → "
+                        + str(research.get("pages_target", "origin/main"))
+                        if research.get("pages_auto_push")
+                        else "DISABLED · GUI/CLI manual publish remains available"
+                    ),
+                ),
+                ("Deployment safety", "CI and complete artifact validation before Pages switch"),
+            ],
+            columns=["item", "value"],
+        )
+        body = _metrics_cards(
+            [
+                ("Local Build", "PASS", False),
+                ("Core Pages", 4, False),
+                ("Data Date", context.data_date, False),
+                ("Remote Deploy", "GitHub Actions", False),
+            ]
+        )
+        body += f'<section class="panel"><h2 class="section-title">Pages 发布链路</h2><div class="small">DAILY / WEEKLY 原子生成 → 本地完整性校验 → 仅覆盖远端 main 的 docs/ → CI → GitHub Pages。任何生成、推送、CI 或部署失败都保留上一版健康页面。</div>{_table(rows, [("item","Item"),("value","Value")])}</section>'
+        return _page(f"{self.title} · 发布状态", context.data_date, body, "publish")
+
+
+def _valid_document(content: str) -> bool:
+    return len(content) >= 800 and "</html>" in content.lower()
+
+
+def _valid_existing_document(content: str, docs_dir: Path) -> bool:
+    if not _valid_document(content):
+        return False
+    root = docs_dir.resolve()
+    for reference in LOCAL_ASSET_REFERENCE.findall(content):
+        clean = reference.split("?", 1)[0].split("#", 1)[0]
+        target = (root / clean).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            return False
+        if not target.exists():
+            return False
+    return True
 
 
 def write_status_json(path: str | Path, payload: Mapping[str, Any]) -> None:

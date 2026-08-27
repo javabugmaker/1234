@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 from .config import load_config
@@ -52,6 +53,10 @@ def build_parser() -> argparse.ArgumentParser:
     daily = sub.add_parser("daily", help="increment, infer, rank and publish daily pages")
     daily.add_argument("--skip-update", action="store_true")
     sub.add_parser("weekly", help="publish the professional weekly research report")
+    sub.add_parser(
+        "publish-pages",
+        help="validate and safely push only docs/ to the configured Git branch",
+    )
     sub.add_parser("gui", help="launch the non-blocking Tkinter desktop dashboard")
     sub.add_parser("models", help="print the model registry")
     promote = sub.add_parser("promote", help="promote a challenger to champion")
@@ -87,6 +92,8 @@ def main(argv: list[str] | None = None) -> int:
         pipeline.daily(skip_update=args.skip_update)
     elif args.command == "weekly":
         pipeline.weekly()
+    elif args.command == "publish-pages":
+        print(json.dumps(asdict(pipeline.publish_pages()), ensure_ascii=False, indent=2))
     elif args.command == "models":
         print(json.dumps(ModelRegistry(config.paths.models_dir).read(), ensure_ascii=False, indent=2))
     elif args.command == "promote":

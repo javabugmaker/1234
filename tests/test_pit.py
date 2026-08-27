@@ -70,13 +70,16 @@ def test_explicit_degraded_membership_preserves_history_without_silent_strict_fa
     )
     pipeline = NeuralAlphaPipeline(AppConfig(paths=paths))
     pipeline.store.write_universe_snapshot(
-        pd.DataFrame({"symbol": ["A"]}), "2024-06-01"
+        pd.DataFrame(
+            {"symbol": ["600000.SH"], "instrument_type": ["stock"]}
+        ),
+        "2024-06-01",
     )
     historical = pd.DataFrame(
         {
-            "symbol": ["A", "B"],
-            "trade_date": pd.to_datetime(["2020-01-02", "2020-01-02"]),
-            "label_20": [0.1, 0.2],
+            "symbol": ["600000.SH", "000001.SZ", "560990.SH"],
+            "trade_date": pd.to_datetime(["2020-01-02"] * 3),
+            "label_20": [0.1, 0.2, 0.3],
         }
     )
 
@@ -84,7 +87,7 @@ def test_explicit_degraded_membership_preserves_history_without_silent_strict_fa
         pipeline._apply_observed_membership(historical, strict=True)
 
     degraded = pipeline._apply_observed_membership(historical, strict=False)
-    pd.testing.assert_frame_equal(degraded, historical)
+    assert degraded["symbol"].tolist() == ["600000.SH", "000001.SZ"]
 
 
 def test_strict_membership_uses_only_observed_snapshot_members(tmp_path) -> None:
@@ -99,14 +102,17 @@ def test_strict_membership_uses_only_observed_snapshot_members(tmp_path) -> None
     )
     pipeline = NeuralAlphaPipeline(AppConfig(paths=paths))
     pipeline.store.write_universe_snapshot(
-        pd.DataFrame({"symbol": ["A"]}), "2024-06-01"
+        pd.DataFrame(
+            {"symbol": ["600000.SH"], "instrument_type": ["stock"]}
+        ),
+        "2024-06-01",
     )
     observed = pd.DataFrame(
         {
-            "symbol": ["A", "B"],
+            "symbol": ["600000.SH", "000001.SZ"],
             "trade_date": pd.to_datetime(["2024-06-03", "2024-06-03"]),
         }
     )
 
     strict = pipeline._apply_observed_membership(observed, strict=True)
-    assert strict["symbol"].tolist() == ["A"]
+    assert strict["symbol"].tolist() == ["600000.SH"]

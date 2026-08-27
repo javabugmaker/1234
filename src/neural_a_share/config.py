@@ -41,6 +41,7 @@ class DataConfig:
     max_staleness_trading_days: int = 1
     min_history_days: int = 260
     universe_snapshot_hour_cst: int = 15
+    min_feature_coverage: float = 0.80
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,7 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class PortfolioConfig:
+    selection_instrument_types: tuple[str, ...] = ("stock",)
     top_k: int = 30
     rebalance_every: int = 5
     initial_cash: float = 1_000_000.0
@@ -114,6 +116,9 @@ class ReportConfig:
     title: str = "TickFlow Neural Alpha"
     timezone: str = "Asia/Shanghai"
     rolling_ic_window: int = 63
+    auto_push_pages: bool = False
+    pages_remote: str = "origin"
+    pages_branch: str = "main"
 
 
 @dataclass(frozen=True)

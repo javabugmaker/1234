@@ -32,8 +32,15 @@ from .model import (
     predict_array,
     save_checkpoint,
 )
+from .pages_publish import PagesPublishResult, publish_pages_to_git
 from .reports import ReportContext, StaticReportPublisher, write_status_json
 from .research import PartitionedResearchLoader, ResearchSplitSpec
+from .universe import (
+    STOCK_CLASSIFIER_VERSION,
+    filter_catalog,
+    filter_degraded_symbol_universe,
+    filter_feature_coverage,
+)
 from .walk_forward import PurgedWalkForward, WalkForwardFold
 from .walk_forward_cache import (
     WALK_FORWARD_CACHE_VERSION,
@@ -128,6 +135,10 @@ class NeuralAlphaPipeline:
                 start_date=start - pd.Timedelta(days=400),
                 end_date=end + pd.Timedelta(days=120),
             )
+            # Keep the established feature definition and the existing
+            # checkpoint's input distribution intact. Asset eligibility is
+            # applied to research rows and inference candidates after causal
+            # features have been built, never as an extra ranking score.
             feature_context = context[pd.to_datetime(context["trade_date"]) <= end]
             self.emit(f"Features {year} ({number}/{len(targets)})", (number - 1) / max(len(targets), 1))
             feature_result = build_features(feature_context, self.config.features)
@@ -150,6 +161,10 @@ class NeuralAlphaPipeline:
                 "feature_names": FEATURE_NAMES,
                 "years": targets,
                 "rows": rows,
+                "selection_instrument_types": list(
+                    self.config.portfolio.selection_instrument_types
+                ),
+                "stock_classifier_version": STOCK_CLASSIFIER_VERSION,
                 "built_at": pd.Timestamp.now(tz="Asia/Shanghai"),
             },
         )
@@ -168,13 +183,13 @@ class NeuralAlphaPipeline:
         )
 
     def _apply_observed_membership(self, frame: pd.DataFrame, strict: bool = True) -> pd.DataFrame:
-        # The override is deliberately explicit.  Applying the first observed
-        # snapshot to older rows would both erase the historical sample and
-        # falsely imply that membership was known at those dates.  Degraded
-        # research therefore keeps the cached bar universe unchanged and marks
-        # every resulting artifact as DEGRADED; strict mode remains fail-closed.
+        allowed_types = self.config.portfolio.selection_instrument_types
+        # The override is deliberately explicit. Applying today's catalog to
+        # older rows would create survivorship bias. Degraded research therefore
+        # uses only deterministic symbol-level asset classification and remains
+        # marked DEGRADED; strict membership stays fail-closed.
         if not strict:
-            return frame
+            return filter_degraded_symbol_universe(frame, allowed_types)
         snapshots = self.store.universe_snapshot_dates()
         audit = audit_survivorship(snapshots, frame["trade_date"].min() if not frame.empty else None)
         if audit.status != "PASS":
@@ -190,7 +205,11 @@ class NeuralAlphaPipeline:
         ordered = sorted(snapshots)
         for index, snapshot_date in enumerate(ordered):
             end = ordered[index + 1] - pd.Timedelta(days=1) if index + 1 < len(ordered) else frame["trade_date"].max()
-            members = set(self.store.read_universe_asof(snapshot_date, strict=True)["symbol"])
+            observed_catalog = self.store.read_universe_asof(
+                snapshot_date, strict=True
+            )
+            eligible_catalog = filter_catalog(observed_catalog, allowed_types)
+            members = set(eligible_catalog["symbol"])
             eligible = frame[
                 frame["trade_date"].between(snapshot_date, end) & frame["symbol"].isin(members)
             ]
@@ -209,6 +228,33 @@ class NeuralAlphaPipeline:
         label_columns = [f"label_{h}" for h in self.config.labels.horizons]
         train = train.dropna(subset=label_columns, how="all")
         validation = validation.dropna(subset=label_columns, how="all")
+        validation_dates = set(pd.to_datetime(validation["trade_date"]).dt.normalize())
+        train_before = len(train)
+        validation_before = len(validation)
+        train = filter_feature_coverage(
+            train,
+            FEATURE_NAMES,
+            self.config.data.min_feature_coverage,
+        )
+        validation = filter_feature_coverage(
+            validation,
+            FEATURE_NAMES,
+            self.config.data.min_feature_coverage,
+        )
+        retained_validation_dates = set(
+            pd.to_datetime(validation["trade_date"]).dt.normalize()
+        )
+        if missing_dates := validation_dates - retained_validation_dates:
+            raise ValueError(
+                "feature completeness removed entire validation dates: "
+                + ", ".join(str(pd.Timestamp(value).date()) for value in sorted(missing_dates)[:5])
+            )
+        self.emit(
+            f"Feature coverage >= {self.config.data.min_feature_coverage:.0%} · "
+            f"train {len(train):,}/{train_before:,} · "
+            f"validation {len(validation):,}/{validation_before:,}",
+            None,
+        )
         if train.empty or validation.empty:
             raise ValueError("train or validation has no mature labels")
         train = _downsample(train, self.config.model.max_train_rows, self.config.model.seed)
@@ -347,6 +393,10 @@ class NeuralAlphaPipeline:
                 "validation_start": validation_dates[0],
                 "validation_end": validation_dates[-1],
                 "purge_days": purge,
+                "selection_instrument_types": list(
+                    self.config.portfolio.selection_instrument_types
+                ),
+                "min_feature_coverage": self.config.data.min_feature_coverage,
                 "survivorship_status": survivorship_status,
                 "survivorship_detail": (
                     "membership was known at each signal date"
@@ -392,6 +442,11 @@ class NeuralAlphaPipeline:
                 "feature_names": FEATURE_NAMES,
                 "horizons": self.config.labels.horizons,
                 "model": asdict(self.config.model),
+                "data": asdict(self.config.data),
+                "selection_instrument_types": list(
+                    self.config.portfolio.selection_instrument_types
+                ),
+                "stock_classifier_version": STOCK_CLASSIFIER_VERSION,
                 "walk_forward": asdict(self.config.walk_forward),
                 "survivorship_status": survivorship_status,
                 "sources": file_inventory(
@@ -531,13 +586,23 @@ class NeuralAlphaPipeline:
                 survivorship_status=survivorship_status,
                 training_progress=training_progress,
             )
-            test_features = test.dropna(subset=FEATURE_NAMES, how="all").copy()
+            test_features = filter_feature_coverage(
+                test,
+                FEATURE_NAMES,
+                self.config.data.min_feature_coverage,
+            )
             scored = inference_frame(
                 model,
                 normalizer,
                 test_features,
                 FEATURE_NAMES,
                 self.config.model.device,
+            )
+            scored = scored.merge(
+                test_features[["symbol", "trade_date", "FeatureCoverage"]],
+                on=["symbol", "trade_date"],
+                how="left",
+                validate="one_to_one",
             )
             scored["fold_id"] = fold.fold_id
             scored["sample_zone"] = sample_zone
@@ -585,6 +650,10 @@ class NeuralAlphaPipeline:
                 "cached_folds": cached_folds,
                 "resume_enabled": bool(resume),
                 "cache_version": WALK_FORWARD_CACHE_VERSION,
+                "selection_instrument_types": list(
+                    self.config.portfolio.selection_instrument_types
+                ),
+                "min_feature_coverage": self.config.data.min_feature_coverage,
                 "predictions": prediction_rows,
             },
         )
@@ -652,8 +721,13 @@ class NeuralAlphaPipeline:
         self.emit(f"Backtest complete · NAV {result.nav['nav'].iloc[-1]:,.2f}", 1.0)
         return result
 
-    def _current_catalog(self) -> pd.DataFrame:
+    def _current_catalog(
+        self, asof_date: pd.Timestamp | None = None
+    ) -> pd.DataFrame:
         dates = self.store.universe_snapshot_dates()
+        if asof_date is not None:
+            target = pd.Timestamp(asof_date).normalize()
+            dates = [date for date in dates if date <= target]
         if not dates:
             return pd.DataFrame()
         return self.store.read_universe_asof(dates[-1], strict=True)
@@ -665,9 +739,36 @@ class NeuralAlphaPipeline:
         context = self.store.read_bars(start_date=latest - pd.Timedelta(days=420), end_date=latest)
         feature_result = build_features(context, self.config.features)
         latest_features = feature_result.frame[feature_result.frame["trade_date"].eq(latest)].copy()
-        catalog = self._current_catalog()
-        if not catalog.empty:
+        observed_catalog = self._current_catalog(latest)
+        catalog = filter_catalog(
+            observed_catalog,
+            self.config.portfolio.selection_instrument_types,
+        )
+        if not observed_catalog.empty:
+            if catalog.empty:
+                raise ValueError(
+                    "observed TickFlow catalog has no eligible stock candidates"
+                )
             latest_features = latest_features[latest_features["symbol"].isin(set(catalog["symbol"]))]
+        else:
+            self.emit(
+                "No universe snapshot was observable by the signal date; "
+                "using identifier-only stock classification",
+                None,
+            )
+            latest_features = filter_degraded_symbol_universe(
+                latest_features,
+                self.config.portfolio.selection_instrument_types,
+            )
+        latest_features = filter_feature_coverage(
+            latest_features,
+            FEATURE_NAMES,
+            self.config.data.min_feature_coverage,
+        )
+        if latest_features.empty:
+            raise ValueError(
+                "no stock has enough point-in-time feature coverage for daily inference"
+            )
         model, normalizer, metadata = load_checkpoint(self.registry.champion_checkpoint())
         if tuple(metadata.feature_names) != tuple(FEATURE_NAMES):
             raise ValueError("champion feature schema does not match current code")
@@ -678,13 +779,90 @@ class NeuralAlphaPipeline:
             FEATURE_NAMES,
             self.config.model.device,
         )
+        predictions = predictions.merge(
+            latest_features[["symbol", "trade_date", "FeatureCoverage"]],
+            on=["symbol", "trade_date"],
+            how="left",
+            validate="one_to_one",
+        )
         if not catalog.empty:
+            catalog = catalog.copy()
+            for column in ("name", "instrument_type"):
+                if column not in catalog:
+                    catalog[column] = ""
             predictions = predictions.merge(
                 catalog[["symbol", "name", "instrument_type"]].drop_duplicates("symbol"),
                 on="symbol",
                 how="left",
             )
         return predictions, metadata
+
+    def publish_pages(self) -> PagesPublishResult:
+        """Validate and push only docs/ without touching the caller's Git state."""
+
+        self.emit("Validating complete Pages site", 0.91)
+        result = publish_pages_to_git(
+            self.config.paths.docs_dir,
+            remote=self.config.reports.pages_remote,
+            branch=self.config.reports.pages_branch,
+            message=f"reports: publish TickFlow Pages {self.store.latest_bar_date() or ''}".rstrip(),
+            progress=lambda message: self.emit(message, None),
+        )
+        write_status_json(
+            self.config.paths.docs_dir / "pages-publish-status.json",
+            {
+                "status": "PUSHED" if result.pushed else "UNCHANGED",
+                "commit_sha": result.commit_sha,
+                "remote": result.remote,
+                "branch": result.branch,
+                "pages": result.pages,
+                "updated_at": pd.Timestamp.now(tz="Asia/Shanghai"),
+            },
+        )
+        self.emit(
+            (
+                f"Pages pushed · {result.commit_sha[:12]}"
+                if result.pushed
+                else f"Pages already current · {result.commit_sha[:12]}"
+            ),
+            0.99,
+        )
+        return result
+
+    def _auto_publish_pages(self) -> PagesPublishResult | None:
+        if not self.config.reports.auto_push_pages:
+            self.emit("Pages auto-push disabled; local site is ready", None)
+            return None
+        try:
+            return self.publish_pages()
+        except Exception as exc:
+            # A credential, network, branch-protection, CI or deployment
+            # failure must never invalidate the already healthy local/remote
+            # site. The manual GUI/CLI command remains available for retry.
+            LOGGER.exception("Pages auto-push failed")
+            try:
+                write_status_json(
+                    self.config.paths.docs_dir / "pages-publish-status.json",
+                    {
+                        "status": "FAILED",
+                        "detail": (
+                            "See the local GUI/log for the Git authentication, "
+                            "network, branch protection, CI or deployment error."
+                        ),
+                        "error_type": type(exc).__name__,
+                        "remote": self.config.reports.pages_remote,
+                        "branch": self.config.reports.pages_branch,
+                        "updated_at": pd.Timestamp.now(tz="Asia/Shanghai"),
+                    },
+                )
+            except Exception:
+                LOGGER.exception("Unable to persist Pages failure status")
+            self.emit(
+                "Pages auto-push failed; previous healthy site is unchanged · "
+                f"{type(exc).__name__}: {exc}",
+                None,
+            )
+            return None
 
     def daily(self, skip_update: bool = False) -> pd.DataFrame:
         quality = (
@@ -709,11 +887,25 @@ class NeuralAlphaPipeline:
                 "tickflow_status": quality.status,
                 "model_version": metadata.model_version,
                 "training_cutoff": metadata.training_cutoff,
+                "signal_source": "champion_mlp",
+                "selection_instrument_types": list(
+                    self.config.portfolio.selection_instrument_types
+                ),
+                "min_feature_coverage": self.config.data.min_feature_coverage,
                 "top_k": predictions.nsmallest(self.config.portfolio.top_k, "NeuralRank")[
-                    ["symbol", "Alpha20", "Alpha40", "Alpha60", "NeuralAlpha", "NeuralRank"]
+                    [
+                        "symbol",
+                        "Alpha20",
+                        "Alpha40",
+                        "Alpha60",
+                        "NeuralAlpha",
+                        "NeuralRank",
+                        "FeatureCoverage",
+                    ]
                 ].to_dict("records"),
             },
         )
+        self._auto_publish_pages()
         self.emit(f"DAILY published · {len(predictions)} neural predictions", 1.0)
         return predictions
 
@@ -746,6 +938,7 @@ class NeuralAlphaPipeline:
             quality,
         )
         self.publisher.publish(context, include_weekly=True)
+        self._auto_publish_pages()
         self.emit("WEEKLY published", 1.0)
         return context
 
@@ -854,6 +1047,16 @@ class NeuralAlphaPipeline:
                 "purge_embargo": f"{self.config.walk_forward.purge_days} / {self.config.walk_forward.embargo_days} sessions",
                 "champion_challenger": f"{self.registry.read().get('champion') or 'N/A'} / {len(self.registry.read().get('challengers', []))}",
                 "topk_performance": f"Top {self.config.portfolio.top_k}, rebalance every {self.config.portfolio.rebalance_every} sessions",
+                "selection_universe": " / ".join(
+                    str(value).upper()
+                    for value in self.config.portfolio.selection_instrument_types
+                ),
+                "min_feature_coverage": f"{self.config.data.min_feature_coverage:.0%}",
+                "pages_auto_push": bool(self.config.reports.auto_push_pages),
+                "pages_target": (
+                    f"{self.config.reports.pages_remote}/"
+                    f"{self.config.reports.pages_branch}"
+                ),
                 "yearly_regime_ic": "computed only after each bucket has mature OOS labels",
             }
         )
