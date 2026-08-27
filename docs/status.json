@@ -1,0 +1,283 @@
+{
+  "latest_date": "2026-08-27 00:00:00",
+  "tickflow_status": "PASS",
+  "model_version": "mlp-2026-08-27-20260827T115146Z-b6907767-degraded",
+  "training_cutoff": "2026-08-27",
+  "signal_source": "champion_mlp",
+  "selection_instrument_types": [
+    "stock"
+  ],
+  "min_feature_coverage": 0.8,
+  "top_k": [
+    {
+      "symbol": "920871.BJ",
+      "Alpha20": 0.012816470116376877,
+      "Alpha40": 0.02503812499344349,
+      "Alpha60": 0.018723461776971817,
+      "NeuralAlpha": 0.01885935291647911,
+      "NeuralRank": 1,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "301578.SZ",
+      "Alpha20": 0.013373561203479767,
+      "Alpha40": 0.02280976064503193,
+      "Alpha60": 0.008559695445001125,
+      "NeuralAlpha": 0.01491433847695589,
+      "NeuralRank": 2,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "920076.BJ",
+      "Alpha20": 0.00855233147740364,
+      "Alpha40": 0.022709496319293976,
+      "Alpha60": 0.009029417298734188,
+      "NeuralAlpha": 0.013430415652692318,
+      "NeuralRank": 3,
+      "FeatureCoverage": 0.9508196711540222
+    },
+    {
+      "symbol": "605199.SH",
+      "Alpha20": 0.009810402989387512,
+      "Alpha40": 0.012502219527959824,
+      "Alpha60": 0.015232603065669537,
+      "NeuralAlpha": 0.012515075504779816,
+      "NeuralRank": 4,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "920027.BJ",
+      "Alpha20": 0.013719482347369194,
+      "Alpha40": 0.014493381604552269,
+      "Alpha60": 0.008240236900746822,
+      "NeuralAlpha": 0.012151033617556095,
+      "NeuralRank": 5,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "688581.SH",
+      "Alpha20": 0.006035698112100363,
+      "Alpha40": 0.01525641418993473,
+      "Alpha60": 0.013062073849141598,
+      "NeuralAlpha": 0.01145139615982771,
+      "NeuralRank": 6,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "920926.BJ",
+      "Alpha20": 0.009409619495272636,
+      "Alpha40": 0.011194130405783653,
+      "Alpha60": 0.013639486394822598,
+      "NeuralAlpha": 0.011414412409067154,
+      "NeuralRank": 7,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "605259.SH",
+      "Alpha20": 0.006658458616584539,
+      "Alpha40": 0.013084294274449348,
+      "Alpha60": 0.01380660105496645,
+      "NeuralAlpha": 0.011183117516338825,
+      "NeuralRank": 8,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "920892.BJ",
+      "Alpha20": 0.00976928137242794,
+      "Alpha40": 0.00823337770998478,
+      "Alpha60": 0.0130680026486516,
+      "NeuralAlpha": 0.010356887243688107,
+      "NeuralRank": 9,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "920245.BJ",
+      "Alpha20": 0.010344121605157852,
+      "Alpha40": 0.012319566681981087,
+      "Alpha60": 0.007237296551465988,
+      "NeuralAlpha": 0.009966994635760784,
+      "NeuralRank": 10,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "920212.BJ",
+      "Alpha20": 0.009885149076581001,
+      "Alpha40": 0.00979967974126339,
+      "Alpha60": 0.010083955712616444,
+      "NeuralAlpha": 0.009922928176820278,
+      "NeuralRank": 11,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "920110.BJ",
+      "Alpha20": 0.009343517944216728,
+      "Alpha40": 0.015634313225746155,
+      "Alpha60": 0.004020837135612965,
+      "NeuralAlpha": 0.00966622307896614,
+      "NeuralRank": 12,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "600107.SH",
+      "Alpha20": 0.010052531957626343,
+      "Alpha40": 0.009343719109892845,
+      "Alpha60": 0.00882591214030981,
+      "NeuralAlpha": 0.009407387115061283,
+      "NeuralRank": 13,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "920033.BJ",
+      "Alpha20": 0.007082812022417784,
+      "Alpha40": 0.012983055785298347,
+      "Alpha60": 0.00760156475007534,
+      "NeuralAlpha": 0.009222477674484253,
+      "NeuralRank": 14,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "920263.BJ",
+      "Alpha20": 0.009132398292422295,
+      "Alpha40": 0.013005556538701057,
+      "Alpha60": 0.005021947436034679,
+      "NeuralAlpha": 0.009053301066160202,
+      "NeuralRank": 15,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "920016.BJ",
+      "Alpha20": 0.007842456921935081,
+      "Alpha40": 0.012404762208461761,
+      "Alpha60": 0.006812128238379955,
+      "NeuralAlpha": 0.009019781835377216,
+      "NeuralRank": 16,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "920180.BJ",
+      "Alpha20": 0.007451386656612158,
+      "Alpha40": 0.013219589367508888,
+      "Alpha60": 0.005340590141713619,
+      "NeuralAlpha": 0.008670522831380367,
+      "NeuralRank": 17,
+      "FeatureCoverage": 0.9508196711540222
+    },
+    {
+      "symbol": "920663.BJ",
+      "Alpha20": 0.008212277665734291,
+      "Alpha40": 0.008855292573571205,
+      "Alpha60": 0.008757050149142742,
+      "NeuralAlpha": 0.008608207106590271,
+      "NeuralRank": 18,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "688816.SH",
+      "Alpha20": 0.010108374059200287,
+      "Alpha40": 0.011392777785658836,
+      "Alpha60": 0.0028833262622356415,
+      "NeuralAlpha": 0.008128159679472446,
+      "NeuralRank": 19,
+      "FeatureCoverage": 0.9508196711540222
+    },
+    {
+      "symbol": "920101.BJ",
+      "Alpha20": 0.009587362408638,
+      "Alpha40": 0.011353785172104836,
+      "Alpha60": 0.0032456470653414726,
+      "NeuralAlpha": 0.008062264882028103,
+      "NeuralRank": 20,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "920703.BJ",
+      "Alpha20": 0.005845007952302694,
+      "Alpha40": 0.011337380856275558,
+      "Alpha60": 0.006993267685174942,
+      "NeuralAlpha": 0.008058552630245686,
+      "NeuralRank": 21,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "920792.BJ",
+      "Alpha20": 0.006982268299907446,
+      "Alpha40": 0.011030403897166252,
+      "Alpha60": 0.005584662780165672,
+      "NeuralAlpha": 0.007865778170526028,
+      "NeuralRank": 22,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "600136.SH",
+      "Alpha20": 0.006016451399773359,
+      "Alpha40": 0.011776367202401161,
+      "Alpha60": 0.005769770592451096,
+      "NeuralAlpha": 0.00785419624298811,
+      "NeuralRank": 23,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "920679.BJ",
+      "Alpha20": 0.007193788420408964,
+      "Alpha40": 0.009855996817350388,
+      "Alpha60": 0.006424778141081333,
+      "NeuralAlpha": 0.007824853993952274,
+      "NeuralRank": 24,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "920278.BJ",
+      "Alpha20": 0.006577086169272661,
+      "Alpha40": 0.011613039299845695,
+      "Alpha60": 0.004847637377679348,
+      "NeuralAlpha": 0.007679253816604614,
+      "NeuralRank": 25,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "920123.BJ",
+      "Alpha20": 0.008937543258070946,
+      "Alpha40": 0.013828795403242111,
+      "Alpha60": -0.00014657620340585709,
+      "NeuralAlpha": 0.007539920508861542,
+      "NeuralRank": 26,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "603489.SH",
+      "Alpha20": 0.009239986538887024,
+      "Alpha40": 0.008139654994010925,
+      "Alpha60": 0.004832226783037186,
+      "NeuralAlpha": 0.007403956260532141,
+      "NeuralRank": 27,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "603170.SH",
+      "Alpha20": 0.007660409901291132,
+      "Alpha40": 0.010805828496813774,
+      "Alpha60": 0.003288757987320423,
+      "NeuralAlpha": 0.007251664996147156,
+      "NeuralRank": 28,
+      "FeatureCoverage": 1.0
+    },
+    {
+      "symbol": "920168.BJ",
+      "Alpha20": 0.0050714160315692425,
+      "Alpha40": 0.012477386742830276,
+      "Alpha60": 0.004204331897199154,
+      "NeuralAlpha": 0.007251045200973749,
+      "NeuralRank": 29,
+      "FeatureCoverage": 0.9508196711540222
+    },
+    {
+      "symbol": "920378.BJ",
+      "Alpha20": 0.0076504661701619625,
+      "Alpha40": 0.009114408865571022,
+      "Alpha60": 0.004427400417625904,
+      "NeuralAlpha": 0.007064091507345438,
+      "NeuralRank": 30,
+      "FeatureCoverage": 1.0
+    }
+  ]
+}
