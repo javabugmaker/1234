@@ -34,8 +34,6 @@ jobs:
         run: python scripts/validate_pages.py docs
       - name: Configure Pages
         uses: actions/configure-pages@v5
-        with:
-          enablement: true
       - name: Upload immutable Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:

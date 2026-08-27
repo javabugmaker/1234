@@ -167,3 +167,10 @@ data/predictions/            每日预测（不提交）
 data/backtests/              OOS 与账本（不提交）
 .github/workflows/           CI 与原子 Pages 部署
 ```
+
+## GitHub Pages 首次启用
+
+仓库管理员首次需要在 `Settings → Pages → Build and deployment → Source` 选择
+`GitHub Actions`。这是 GitHub 的一次性仓库设置；标准 `GITHUB_TOKEN` 无权替仓库
+开启 Pages。启用后，`CI` 成功会触发 `Deploy Pages`，完整 artifact 校验、上传和部署
+都成功后才切换线上版本，因此发布失败不会覆盖上一版健康页面。
