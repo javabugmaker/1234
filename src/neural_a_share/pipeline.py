@@ -11,6 +11,7 @@ from typing import Any, Callable, Iterable, Sequence
 import numpy as np
 import pandas as pd
 
+from .audit import prediction_fingerprint, validation_stability_audit
 from .backtest import BacktestResult, PortfolioBacktester, prepare_signal_targets
 from .config import AppConfig
 from .data.pit import audit_survivorship, reconstruct_pit_prices
@@ -224,6 +225,10 @@ class NeuralAlphaPipeline:
         training_cutoff: pd.Timestamp,
         survivorship_status: str = "PASS",
         training_progress: Callable[[int, int, float, float], None] | None = None,
+        *,
+        data_cutoff: pd.Timestamp | None = None,
+        train_period: tuple[pd.Timestamp, pd.Timestamp] | None = None,
+        validation_period: tuple[pd.Timestamp, pd.Timestamp] | None = None,
     ) -> tuple[MultiTaskMLP, FeatureNormalizer, CheckpointMetadata, Any]:
         label_columns = [f"label_{h}" for h in self.config.labels.horizons]
         train = train.dropna(subset=label_columns, how="all")
@@ -287,13 +292,25 @@ class NeuralAlphaPipeline:
         output = predict_array(model, validation_x, self.config.model.device)
         scored = validation[["trade_date", "symbol", *label_columns]].copy()
         metrics: dict[str, float] = {"validation_loss": training_result.best_validation_loss}
+        daily_ic: dict[int, pd.Series] = {}
         for index, horizon in enumerate(self.config.labels.horizons):
             column = f"Alpha{horizon}"
             scored[column] = output[:, index]
-            summary = summarize_ic(rank_ic_by_date(scored, column, f"label_{horizon}"))
+            daily = rank_ic_by_date(scored, column, f"label_{horizon}")
+            daily_ic[int(horizon)] = daily
+            summary = summarize_ic(daily)
             metrics[f"rank_ic_{horizon}"] = summary.mean
             metrics[f"icir_{horizon}"] = summary.icir
             metrics[f"newey_west_t_{horizon}"] = summary.newey_west_t
+        validation_audit = validation_stability_audit(daily_ic)
+        actual_train_period = train_period or (
+            pd.Timestamp(train["trade_date"].min()),
+            pd.Timestamp(train["trade_date"].max()),
+        )
+        actual_validation_period = validation_period or (
+            pd.Timestamp(validation["trade_date"].min()),
+            pd.Timestamp(validation["trade_date"].max()),
+        )
         metadata = CheckpointMetadata(
             model_version=model_version,
             training_cutoff=str(pd.Timestamp(training_cutoff).date()),
@@ -303,6 +320,20 @@ class NeuralAlphaPipeline:
             dropout=self.config.model.dropout,
             metrics=metrics,
             survivorship_status=survivorship_status,
+            training_cutoff_semantics="last_train_signal_date",
+            data_cutoff=(
+                str(pd.Timestamp(data_cutoff).date())
+                if data_cutoff is not None
+                else None
+            ),
+            train_start=str(pd.Timestamp(actual_train_period[0]).date()),
+            train_end=str(pd.Timestamp(actual_train_period[1]).date()),
+            validation_start=str(
+                pd.Timestamp(actual_validation_period[0]).date()
+            ),
+            validation_end=str(pd.Timestamp(actual_validation_period[1]).date()),
+            training_seed=int(self.config.model.seed),
+            validation_audit=validation_audit,
         )
         return model, normalizer, metadata, training_result
 
@@ -350,7 +381,8 @@ class NeuralAlphaPipeline:
         )
         train = prepared["train"]
         validation = prepared["validation"]
-        version = make_model_version(latest, FEATURE_NAMES)
+        training_cutoff = pd.Timestamp(train_dates[-1])
+        version = make_model_version(training_cutoff, FEATURE_NAMES)
         if survivorship_status == "DEGRADED":
             version = f"{version}-degraded"
         self.emit(
@@ -375,19 +407,56 @@ class NeuralAlphaPipeline:
             train,
             validation,
             version,
-            latest,
+            training_cutoff,
             survivorship_status=survivorship_status,
             training_progress=training_progress,
+            data_cutoff=latest,
+            train_period=(train_dates[0], train_dates[-1]),
+            validation_period=(validation_dates[0], validation_dates[-1]),
         )
         checkpoint = self.config.paths.models_dir / version / "checkpoint.pt"
         save_checkpoint(checkpoint, model, normalizer, metadata, result)
         role = "champion" if self.registry.read().get("champion") is None else "challenger"
+        history = list(result.history)
+        best_epoch = (
+            int(min(history, key=lambda row: row["validation_loss"])["epoch"])
+            if history
+            else None
+        )
+        training_audit = {
+            "model_version": version,
+            "role": role,
+            "training_cutoff": training_cutoff,
+            "training_cutoff_semantics": "last_train_signal_date",
+            "data_cutoff": latest,
+            "label_maturity_cutoff": latest,
+            "train_start": train_dates[0],
+            "train_end": train_dates[-1],
+            "validation_start": validation_dates[0],
+            "validation_end": validation_dates[-1],
+            "purge_days": purge,
+            "epochs_trained": int(result.epochs_trained),
+            "best_epoch": best_epoch,
+            "best_validation_loss": float(result.best_validation_loss),
+            "stopped_early": bool(result.stopped_early),
+            "device": str(result.device),
+            "amp_enabled": bool(result.amp_enabled),
+            "training_seed": int(self.config.model.seed),
+            "history": history,
+            "metrics": metadata.metrics,
+            "validation_audit": metadata.validation_audit,
+            "survivorship_status": survivorship_status,
+        }
+        write_status_json(checkpoint.with_name("training_audit.json"), training_audit)
         self.registry.register(metadata, checkpoint, role=role)
         self.store.write_manifest(
             "training",
             {
                 "model_version": version,
-                "training_cutoff": latest,
+                "training_cutoff": training_cutoff,
+                "training_cutoff_semantics": "last_train_signal_date",
+                "data_cutoff": latest,
+                "label_maturity_cutoff": latest,
                 "train_start": train_dates[0],
                 "train_end": train_dates[-1],
                 "validation_start": validation_dates[0],
@@ -405,6 +474,12 @@ class NeuralAlphaPipeline:
                     "current catalog membership was not represented as historical PIT membership"
                 ),
                 "metrics": metadata.metrics,
+                "validation_audit": metadata.validation_audit,
+                "epochs_trained": int(result.epochs_trained),
+                "best_epoch": best_epoch,
+                "stopped_early": bool(result.stopped_early),
+                "device": str(result.device),
+                "amp_enabled": bool(result.amp_enabled),
                 "role": role,
             },
         )
@@ -887,7 +962,13 @@ class NeuralAlphaPipeline:
                 "tickflow_status": quality.status,
                 "model_version": metadata.model_version,
                 "training_cutoff": metadata.training_cutoff,
+                "training_cutoff_semantics": metadata.training_cutoff_semantics,
+                "data_cutoff": metadata.data_cutoff,
                 "signal_source": "champion_mlp",
+                "generated_at": context.generated_at,
+                "prediction_date": context.data_date,
+                "prediction_rows": context.prediction_rows,
+                "prediction_fingerprint": context.prediction_fingerprint,
                 "selection_instrument_types": list(
                     self.config.portfolio.selection_instrument_types
                 ),
@@ -1060,6 +1141,31 @@ class NeuralAlphaPipeline:
                 "yearly_regime_ic": "computed only after each bucket has mature OOS labels",
             }
         )
+        generated_at = pd.Timestamp.now(
+            tz=self.config.reports.timezone
+        ).floor("s")
+        fingerprint = prediction_fingerprint(
+            predictions,
+            model_version=model_version,
+            top_k=self.config.portfolio.top_k,
+        )
+        registry_model = self.registry.read().get("models", {}).get(
+            model_version, {}
+        )
+        cutoff_semantics = str(
+            registry_model.get(
+                "training_cutoff_semantics", "legacy_data_cutoff"
+            )
+        )
+        research.update(
+            {
+                "generated_at": str(generated_at),
+                "prediction_rows": int(len(predictions)),
+                "prediction_fingerprint": fingerprint,
+                "training_cutoff_semantics": cutoff_semantics,
+                "training_data_cutoff": registry_model.get("data_cutoff", "N/A"),
+            }
+        )
         bars = self.store.read_bars(symbols=[self.config.tickflow.benchmark])
         benchmark_nav = pd.DataFrame()
         if not bars.empty:
@@ -1095,6 +1201,10 @@ class NeuralAlphaPipeline:
             model_version=model_version,
             training_cutoff=str(training_cutoff),
             predictions=predictions,
+            generated_at=str(generated_at),
+            prediction_fingerprint=fingerprint,
+            prediction_rows=int(len(predictions)),
+            training_cutoff_semantics=cutoff_semantics,
             rolling_ic=rolling,
             nav=nav,
             benchmark_nav=benchmark_nav,

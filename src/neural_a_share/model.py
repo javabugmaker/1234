@@ -6,7 +6,7 @@ import json
 import os
 import random
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -360,6 +360,14 @@ class CheckpointMetadata:
     dropout: float
     metrics: dict[str, float]
     survivorship_status: str = "PASS"
+    training_cutoff_semantics: str = "last_train_signal_date"
+    data_cutoff: str | None = None
+    train_start: str | None = None
+    train_end: str | None = None
+    validation_start: str | None = None
+    validation_end: str | None = None
+    training_seed: int | None = None
+    validation_audit: dict[str, Any] = field(default_factory=dict)
 
 
 def make_model_version(training_cutoff: str | pd.Timestamp, feature_names: Iterable[str]) -> str:
@@ -411,6 +419,20 @@ def load_checkpoint(path: str | Path, map_location: str = "cpu") -> tuple[MultiT
         dropout=float(raw["dropout"]),
         metrics=dict(raw.get("metrics", {})),
         survivorship_status=str(raw.get("survivorship_status", "PASS")),
+        training_cutoff_semantics=str(
+            raw.get("training_cutoff_semantics", "legacy_data_cutoff")
+        ),
+        data_cutoff=raw.get("data_cutoff"),
+        train_start=raw.get("train_start"),
+        train_end=raw.get("train_end"),
+        validation_start=raw.get("validation_start"),
+        validation_end=raw.get("validation_end"),
+        training_seed=(
+            int(raw["training_seed"])
+            if raw.get("training_seed") is not None
+            else None
+        ),
+        validation_audit=dict(raw.get("validation_audit", {})),
     )
     model = MultiTaskMLP(
         input_dim=len(metadata.feature_names),
@@ -440,10 +462,23 @@ class ModelRegistry:
         registry.setdefault("models", {})[metadata.model_version] = {
             "checkpoint": str(checkpoint),
             "training_cutoff": metadata.training_cutoff,
+            "training_cutoff_semantics": metadata.training_cutoff_semantics,
+            "data_cutoff": metadata.data_cutoff,
+            "train_start": metadata.train_start,
+            "train_end": metadata.train_end,
+            "validation_start": metadata.validation_start,
+            "validation_end": metadata.validation_end,
+            "training_seed": metadata.training_seed,
             "metrics": metadata.metrics,
+            "validation_audit": metadata.validation_audit,
             "survivorship_status": metadata.survivorship_status,
             "registered_at": datetime.now(timezone.utc).isoformat(),
         }
+        audit_path = checkpoint.with_name("training_audit.json")
+        if audit_path.exists():
+            registry["models"][metadata.model_version]["training_audit"] = str(
+                audit_path
+            )
         if role == "champion":
             registry["champion"] = metadata.model_version
         else:

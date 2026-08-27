@@ -35,6 +35,14 @@ def _model_is_degraded(champion: str | None, model: dict[str, Any]) -> bool:
     return status == "DEGRADED" or str(champion or "").lower().endswith("-degraded")
 
 
+def _training_cutoff_text(model: dict[str, Any]) -> str:
+    cutoff = str(model.get("training_cutoff", "—"))
+    semantics = str(
+        model.get("training_cutoff_semantics", "legacy_data_cutoff")
+    )
+    return cutoff if semantics == "last_train_signal_date" else f"{cutoff} · LEGACY"
+
+
 def _cuda_text() -> str:
     try:
         import torch
@@ -327,7 +335,7 @@ class NeuralAlphaApp:
         self.status_vars["latest"].set(str(manifest.get("latest_date", "未更新"))[:10])
         self.status_vars["gpu"].set(_cuda_text())
         self.status_vars["model"].set(champion or "UNTRAINED")
-        self.status_vars["cutoff"].set(str(model.get("training_cutoff", "—")))
+        self.status_vars["cutoff"].set(_training_cutoff_text(model))
         metrics = model.get("metrics", {})
         self.status_vars["ic"].set(" / ".join(f"{metrics.get(f'rank_ic_{h}', float('nan')):.3f}" for h in (20, 40, 60)))
         files = sorted(self.config.paths.predictions_dir.glob("*.parquet"))
@@ -364,7 +372,7 @@ class NeuralAlphaApp:
         for version, info in data.get("models", {}).items():
             metrics = info.get("metrics", {})
             ic = "/".join(f"{metrics.get(f'rank_ic_{h}', float('nan')):.3f}" for h in (20, 40, 60))
-            tree.insert("", "end", iid=version, values=("CHAMPION" if version == champion else "CHALLENGER", version, info.get("training_cutoff"), ic))
+            tree.insert("", "end", iid=version, values=("CHAMPION" if version == champion else "CHALLENGER", version, _training_cutoff_text(info), ic))
         tree.pack(fill="both", expand=True, padx=12, pady=12)
 
         def promote() -> None:

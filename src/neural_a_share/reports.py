@@ -177,6 +177,10 @@ class ReportContext:
     model_version: str
     training_cutoff: str
     predictions: pd.DataFrame
+    generated_at: str = ""
+    prediction_fingerprint: str = ""
+    prediction_rows: int = 0
+    training_cutoff_semantics: str = "legacy_data_cutoff"
     rolling_ic: pd.DataFrame | None = None
     nav: pd.DataFrame | None = None
     benchmark_nav: pd.DataFrame | None = None
@@ -259,14 +263,21 @@ class StaticReportPublisher:
             else pd.DataFrame()
         )
         research = dict(context.research or {})
+        cutoff_label = (
+            "Training Cutoff"
+            if context.training_cutoff_semantics == "last_train_signal_date"
+            else "Legacy Data Cutoff"
+        )
         cards = _metrics_cards(
             [
                 ("TickFlow", context.tickflow_status, False),
                 ("Current Model", context.model_version, False),
-                ("Training Cutoff", context.training_cutoff, False),
+                (cutoff_label, context.training_cutoff, False),
                 ("Stock Universe", len(context.predictions) if context.predictions is not None else 0, False),
                 ("Signal Source", "Champion MLP", False),
                 ("Min Feature Coverage", research.get("min_feature_coverage", "N/A"), False),
+                ("Generated At", context.generated_at or "N/A", False),
+                ("Prediction ID", context.prediction_fingerprint or "N/A", False),
             ]
         )
         table = _table(
@@ -323,6 +334,22 @@ class StaticReportPublisher:
                 ("Top-K Performance", research.get("topk_performance", "N/A")),
                 ("Selection Universe", research.get("selection_universe", "N/A")),
                 ("Min Feature Coverage", research.get("min_feature_coverage", "N/A")),
+                ("Prediction Generated At", context.generated_at or "N/A"),
+                ("Prediction Rows", context.prediction_rows),
+                ("Prediction Fingerprint", context.prediction_fingerprint or "N/A"),
+                (
+                    "Training Data Cutoff",
+                    research.get("training_data_cutoff", "N/A"),
+                ),
+                (
+                    "TrainingCutoff Semantics",
+                    (
+                        "LAST TRAIN SIGNAL DATE"
+                        if context.training_cutoff_semantics
+                        == "last_train_signal_date"
+                        else "LEGACY CHECKPOINT · STORED VALUE WAS DATA CUTOFF"
+                    ),
+                ),
                 ("IC Decay", research.get("ic_decay", "N/A")),
             ],
             columns=["item", "value"],
@@ -339,12 +366,19 @@ class StaticReportPublisher:
             else pd.DataFrame()
         )
         research = dict(context.research or {})
+        cutoff_label = (
+            "TrainingCutoff"
+            if context.training_cutoff_semantics == "last_train_signal_date"
+            else "Legacy Data Cutoff"
+        )
         cards = _metrics_cards(
             [
                 ("最新数据", context.data_date, False),
                 ("TickFlow 状态", context.tickflow_status, False),
                 ("当前模型", context.model_version, False),
-                ("TrainingCutoff", context.training_cutoff, False),
+                (cutoff_label, context.training_cutoff, False),
+                ("生成时间", context.generated_at or "N/A", False),
+                ("Prediction ID", context.prediction_fingerprint or "N/A", False),
             ]
         )
         history = []
@@ -368,6 +402,9 @@ class StaticReportPublisher:
                 ("Core page validation", "PASS"),
                 ("Data cutoff", context.data_date),
                 ("Model", context.model_version),
+                ("Prediction generated at", context.generated_at or "N/A"),
+                ("Prediction rows", context.prediction_rows),
+                ("Prediction fingerprint", context.prediction_fingerprint or "N/A"),
                 ("Signal source", "Champion MLP"),
                 ("Selection universe", research.get("selection_universe", "N/A")),
                 ("PIT status", quality.get("pit_status", "N/A")),

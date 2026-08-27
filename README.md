@@ -97,6 +97,12 @@ Survivorship 模式的签名没有变化时，已完成折会直接复用；需�
 Historical OOS；不传 `--max-folds` 才发布全部可用折。Walk Forward 折只用于历史
 OOS 评价与回测，不会替代 Champion，也不会直接生成 DAILY 榜单。
 
+每次新训练会在模型目录写入 `training_audit.json`，记录真实的最后训练信号日
+`TrainingCutoff`、独立的数据/标签成熟截止日、完整 epoch history、best epoch、AMP/
+device，以及同一固定 Validation 上的 21/63 日长短窗口、6 个连续时间块和 9 个滚动
+锚点稳定性。6 块和 9 锚点只是 `VALIDATION_ONLY` 诊断，不会改动日期切分、自动调参
+或冒充 Test；正式 Historical OOS 仍由全部 67 个 expanding purged folds 给出。
+
 该开关不会改变 Feature、Label、日期切分、Purge/Embargo 或训练抽样，只跳过无法由免费服务追溯证明的历史 membership 过滤。它不能消除现有历史缓存可能包含的 Survivorship Bias；严格模式仍会 fail-closed，且不会自动降级。
 
 常用入口也可直接运行：
@@ -138,6 +144,7 @@ TickFlow.free() 增量日 K
 → Alpha20 / Alpha40 / Alpha60
 → NeuralAlpha / NeuralRank / Top-K
 → predictions/YYYY-MM-DD.{parquet,csv}
+→ 生成时间 + 候选行数 + 稳定 Prediction Fingerprint
 → docs/index.html + daily.html + publish.html + 历史归档
 → 完整站点校验后安全自动推送 docs/（失败不影响 DAILY，也不覆盖健康站点）
 ```
@@ -184,7 +191,10 @@ fail-closed；开启时保留历史缓存样本，并把模型和 Walk-Forward �
 
 GUI 的 Walk Forward 范围旁会明确显示“仅历史 OOS 评估”，并提供独立的
 “发布 Pages”后台按钮。榜单只显示股票；`FeatureCoverage` 会同时写入预测文件、
-日报和首页，方便审计候选资格。
+日报和首页，方便审计候选资格。新 checkpoint 的 `TrainingCutoff` 明确表示最后一个训练
+信号日；旧 checkpoint 没有该语义字段时 GUI 会标记 `LEGACY`，避免把旧版数据截止日
+误当成真实训练截止。首页、日报、周报和发布页同时显示生成时间与 Prediction ID；同一
+模型、同一收盘数据重复运行应得到相同 ID，输入、候选范围或预测变化时 ID 会改变。
 
 ## Pages 自动发布
 
@@ -219,7 +229,9 @@ Promote 新 Challenger。Walk Forward 的缓存签名包含股票范围和完整
 测试覆盖 PIT、标签对齐与成熟度、Purge、Expanding Walk-Forward、逐折缓存/断点续跑、
 年度研究缓存、向量批处理、checkpoint、CUDA/CPU fallback、Rank IC、T+1、股票/ETF
 成本、退出顺延、Position Ledger、NAV、股票候选资格、Feature 覆盖率、Pages 临时 index
-安全推送和 TickFlow 完整性。
+安全推送、预测指纹、长短 Validation/6 块/9 锚点审计和 TickFlow 完整性。Rank IC 使用
+自适应的等价分组秩相关：短 Validation 保留更快的小窗口路径，长 Historical OOS 使用
+向量化归约，避免数千个交易日的 Python 回调开销。
 
 ## 目录
 

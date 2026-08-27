@@ -7,6 +7,9 @@ import numpy as np
 import pandas as pd
 
 
+VECTORIZED_IC_MIN_DATES = 1_024
+
+
 def _spearman(left: pd.Series, right: pd.Series) -> float:
     valid = left.notna() & right.notna()
     if int(valid.sum()) < 3:
@@ -20,10 +23,67 @@ def rank_ic_by_date(
     label_col: str,
     date_col: str = "trade_date",
 ) -> pd.Series:
-    return frame.groupby(date_col, sort=True).apply(
-        lambda group: _spearman(group[prediction_col], group[label_col]),
-        include_groups=False,
-    ).rename(f"rank_ic_{label_col}")
+    """Calculate daily Spearman IC with an adaptive grouped reduction.
+
+    Ranking is performed only on rows where both values are non-null, matching
+    ``_spearman`` exactly.  The grouped Pearson correlation of those ranks is
+    reduced with ``bincount`` for long OOS histories.  Short validation windows
+    retain pandas' faster small-group path.  The statistical definition is
+    identical in both cases.
+    """
+
+    required = {date_col, prediction_col, label_col}
+    missing = required - set(frame.columns)
+    if missing:
+        raise KeyError(f"rank IC columns missing: {sorted(missing)}")
+    name = f"rank_ic_{label_col}"
+    date_count = int(frame[date_col].nunique(dropna=True))
+    if date_count == 0:
+        return pd.Series(dtype="float64", name=name)
+    if date_count < VECTORIZED_IC_MIN_DATES:
+        return frame.groupby(date_col, sort=True).apply(
+            lambda group: _spearman(
+                group[prediction_col], group[label_col]
+            ),
+            include_groups=False,
+        ).rename(name)
+    all_dates = pd.Index(
+        frame[date_col].dropna().unique(), name=date_col
+    ).sort_values()
+
+    valid = (
+        frame[date_col].notna()
+        & frame[prediction_col].notna()
+        & frame[label_col].notna()
+    )
+    paired = frame.loc[valid, [date_col, prediction_col, label_col]]
+    if paired.empty:
+        return pd.Series(np.nan, index=all_dates, dtype="float64", name=name)
+
+    groups = paired.groupby(date_col, sort=True, observed=True)
+    left = groups[prediction_col].rank(method="average").to_numpy(dtype="float64")
+    right = groups[label_col].rank(method="average").to_numpy(dtype="float64")
+    codes, dates = pd.factorize(paired[date_col], sort=True)
+    size = len(dates)
+    counts = np.bincount(codes, minlength=size).astype("float64")
+    sum_left = np.bincount(codes, weights=left, minlength=size)
+    sum_right = np.bincount(codes, weights=right, minlength=size)
+    sum_left_sq = np.bincount(codes, weights=left * left, minlength=size)
+    sum_right_sq = np.bincount(codes, weights=right * right, minlength=size)
+    sum_cross = np.bincount(codes, weights=left * right, minlength=size)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        covariance = sum_cross - sum_left * sum_right / counts
+        variance_left = sum_left_sq - sum_left * sum_left / counts
+        variance_right = sum_right_sq - sum_right * sum_right / counts
+        correlation = covariance / np.sqrt(variance_left * variance_right)
+    correlation[
+        (counts < 3) | (variance_left <= 0.0) | (variance_right <= 0.0)
+    ] = np.nan
+    result = pd.Series(
+        correlation, index=pd.Index(dates, name=date_col), name=name
+    )
+    return result.reindex(all_dates)
 
 
 def newey_west_t(values: Iterable[float], lags: int | None = None) -> float:

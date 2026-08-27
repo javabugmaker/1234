@@ -29,6 +29,10 @@ def test_static_reports_publish_all_core_pages_without_cdn(tmp_path) -> None:
         model_version="mlp-test",
         training_cutoff="2024-01-05",
         predictions=predictions,
+        generated_at="2024-01-08 18:00:00+08:00",
+        prediction_fingerprint="abcdef0123456789",
+        prediction_rows=2,
+        training_cutoff_semantics="last_train_signal_date",
         rolling_ic=rolling,
         nav=nav,
         benchmark_nav=nav,
@@ -40,6 +44,7 @@ def test_static_reports_publish_all_core_pages_without_cdn(tmp_path) -> None:
         content = (tmp_path / filename).read_text(encoding="utf-8")
         assert "</html>" in content
         assert "https://cdn" not in content
+        assert "abcdef0123456789" in content
     assert (tmp_path / "reports" / "2024-01-08" / "daily.html").exists()
     assert (tmp_path / "assets" / "generated" / "2024-01-08" / "nav.svg").exists()
 
