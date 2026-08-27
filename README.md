@@ -99,6 +99,15 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe run_weekly.py
 ```
 
+## 16 GB 内存训练
+
+训练和 Walk-Forward 不会再把全部年份的 features 与 labels 一次性读入后 merge。
+程序先逐年扫描键、成熟日期和必要标签，再逐年读取所需列、校验
+`symbol + trade_date` one-to-one、merge，并立即执行全局有界抽样。特征和数值标签
+在 Arrow 转为 pandas 之前收窄为 `float32`；Validation 保留全部验证日期及可计算
+Rank IC 的横截面结构。现有 `data/cache/derived/**/year=YYYY/*.parquet` 可直接使用，
+不需要重新下载 TickFlow，也不需要重跑 `update --full` 或 `features`。
+
 ## DAILY
 
 ```text

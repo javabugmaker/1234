@@ -31,6 +31,7 @@ from .model import (
     save_checkpoint,
 )
 from .reports import ReportContext, StaticReportPublisher, write_status_json
+from .research import PartitionedResearchLoader, ResearchSplitSpec
 from .walk_forward import PurgedWalkForward, WalkForwardFold
 
 LOGGER = logging.getLogger("neural_a_share")
@@ -146,14 +147,15 @@ class NeuralAlphaPipeline:
         self.emit(f"Derived cache ready · {len(FEATURE_NAMES)} features", 1.0)
         return rows
 
-    def _research_frame(self) -> pd.DataFrame:
-        features = self.store.read_derived_years("features")
-        labels = self.store.read_derived_years("labels")
-        if features.empty or labels.empty:
-            raise FileNotFoundError("feature/label cache missing; run feature build first")
-        frame = features.merge(labels, on=["symbol", "trade_date"], how="inner", validate="one_to_one")
-        frame["trade_date"] = pd.to_datetime(frame["trade_date"]).dt.normalize()
-        return frame.sort_values(["trade_date", "symbol"]).reset_index(drop=True)
+    def _research_loader(self, strict_membership: bool) -> PartitionedResearchLoader:
+        return PartitionedResearchLoader(
+            self.store,
+            FEATURE_NAMES,
+            self.config.labels.horizons,
+            row_filter=lambda frame: self._apply_observed_membership(
+                frame, strict=strict_membership
+            ),
+        )
 
     def _apply_observed_membership(self, frame: pd.DataFrame, strict: bool = True) -> pd.DataFrame:
         snapshots = self.store.universe_snapshot_dates()
@@ -192,11 +194,14 @@ class NeuralAlphaPipeline:
         validation = _downsample(
             validation, self.config.model.max_validation_rows, self.config.model.seed + 1
         )
-        normalizer = FeatureNormalizer().fit(train[FEATURE_NAMES].to_numpy())
-        train_x = normalizer.transform(train[FEATURE_NAMES].to_numpy())
-        validation_x = normalizer.transform(validation[FEATURE_NAMES].to_numpy())
+        train_values = train[FEATURE_NAMES].to_numpy(dtype="float32", copy=False)
+        validation_values = validation[FEATURE_NAMES].to_numpy(dtype="float32", copy=False)
+        normalizer = FeatureNormalizer().fit(train_values)
+        train_x = normalizer.transform(train_values)
+        validation_x = normalizer.transform(validation_values)
         train_y = train[label_columns].to_numpy(dtype="float32")
         validation_y = validation[label_columns].to_numpy(dtype="float32")
+        del train_values, validation_values
         model = MultiTaskMLP(
             input_dim=len(FEATURE_NAMES),
             hidden_dims=self.config.model.hidden_dims,
@@ -206,6 +211,7 @@ class NeuralAlphaPipeline:
         training_result = NeuralTrainer(self.config.model).fit(
             model, train_x, train_y, validation_x, validation_y
         )
+        del train_x, train_y, validation_y
         output = predict_array(model, validation_x, self.config.model.device)
         scored = validation[["trade_date", "symbol", *label_columns]].copy()
         metrics: dict[str, float] = {"validation_loss": training_result.best_validation_loss}
@@ -228,18 +234,16 @@ class NeuralAlphaPipeline:
         return model, normalizer, metadata, training_result
 
     def train(self, allow_degraded_survivorship: bool = False) -> CheckpointMetadata:
-        frame = self._research_frame()
         latest = self.store.latest_bar_date()
         if latest is None:
             raise FileNotFoundError("no TickFlow data")
-        labels = [f"label_{h}" for h in self.config.labels.horizons]
-        maturity = [f"label_available_date_{h}" for h in self.config.labels.horizons]
-        mature = frame[maturity].apply(pd.to_datetime).le(latest).all(axis=1)
-        frame = frame[mature].copy()
-        frame = self._apply_observed_membership(
-            frame, strict=self.config.data.strict_survivorship and not allow_degraded_survivorship
+        strict_membership = (
+            self.config.data.strict_survivorship and not allow_degraded_survivorship
         )
-        dates = pd.DatetimeIndex(frame["trade_date"].drop_duplicates().sort_values())
+        loader = self._research_loader(strict_membership)
+        self.emit("Scanning narrow annual research partitions", 0.01)
+        index = loader.scan(mature_cutoff=latest)
+        dates = index.dates
         validation_days = self.config.walk_forward.validation_days
         purge = self.config.walk_forward.purge_days
         if len(dates) < self.config.walk_forward.initial_train_days + validation_days + purge:
@@ -247,10 +251,30 @@ class NeuralAlphaPipeline:
         validation_dates = dates[-validation_days:]
         train_end_position = len(dates) - validation_days - purge - 1
         train_dates = dates[: train_end_position + 1]
-        train = frame[frame["trade_date"].isin(train_dates)]
-        validation = frame[frame["trade_date"].isin(validation_dates)]
+        prepared = loader.load_splits(
+            index,
+            {
+                "train": ResearchSplitSpec(
+                    train_dates,
+                    self.config.model.max_train_rows,
+                    self.config.model.seed,
+                ),
+                "validation": ResearchSplitSpec(
+                    validation_dates,
+                    self.config.model.max_validation_rows,
+                    self.config.model.seed + 1,
+                    min_rows_per_date=3,
+                ),
+            },
+            mature_cutoff=latest,
+        )
+        train = prepared["train"]
+        validation = prepared["validation"]
         version = make_model_version(latest, FEATURE_NAMES)
-        self.emit(f"Training {version} on {len(train):,} samples", 0.05)
+        self.emit(
+            f"Training {version} on {len(train):,} rows; validation {len(validation):,}",
+            0.05,
+        )
         model, normalizer, metadata, result = self._fit_one(train, validation, version, latest)
         checkpoint = self.config.paths.models_dir / version / "checkpoint.pt"
         save_checkpoint(checkpoint, model, normalizer, metadata, result)
@@ -278,10 +302,12 @@ class NeuralAlphaPipeline:
         max_folds: int | None = None,
         allow_degraded_survivorship: bool = False,
     ) -> pd.DataFrame:
-        frame = self._research_frame()
-        frame = self._apply_observed_membership(
-            frame, strict=self.config.data.strict_survivorship and not allow_degraded_survivorship
+        strict_membership = (
+            self.config.data.strict_survivorship and not allow_degraded_survivorship
         )
+        loader = self._research_loader(strict_membership)
+        self.emit("Scanning narrow annual research partitions", 0.01)
+        index = loader.scan()
         benchmark_bars = self.store.read_bars(symbols=[self.config.tickflow.benchmark])
         dates = pd.DatetimeIndex(
             pd.to_datetime(benchmark_bars["trade_date"]).drop_duplicates().sort_values()
@@ -296,9 +322,32 @@ class NeuralAlphaPipeline:
         fold_rows: list[dict[str, Any]] = []
         for number, fold in enumerate(folds, start=1):
             self.emit(f"Walk-forward fold {fold.fold_id} ({number}/{len(folds)})", (number - 1) / len(folds))
-            train = frame[frame["trade_date"].isin(fold.train_dates)]
-            validation = frame[frame["trade_date"].isin(fold.validation_dates)]
-            test = frame[frame["trade_date"].isin(fold.test_dates)]
+            prepared = loader.load_splits(
+                index,
+                {
+                    "train": ResearchSplitSpec(
+                        fold.train_dates,
+                        self.config.model.max_train_rows,
+                        self.config.model.seed,
+                    ),
+                    "validation": ResearchSplitSpec(
+                        fold.validation_dates,
+                        self.config.model.max_validation_rows,
+                        self.config.model.seed + 1,
+                        min_rows_per_date=3,
+                    ),
+                    "test": ResearchSplitSpec(
+                        fold.test_dates,
+                        limit=None,
+                        seed=self.config.model.seed,
+                        require_any_label=False,
+                        include_labels=False,
+                    ),
+                },
+            )
+            train = prepared["train"]
+            validation = prepared["validation"]
+            test = prepared["test"]
             version = f"wf-{fold.fold_id}-{fold.test_dates[0].date()}"
             model, normalizer, _, _ = self._fit_one(
                 train, validation, version, fold.training_cutoff
@@ -466,8 +515,36 @@ class NeuralAlphaPipeline:
         research: dict[str, Any] = {}
         if oos_path.exists() and self.store.derived_years("labels"):
             oos = pd.read_parquet(oos_path)
-            labels = self.store.read_derived_years("labels")
-            joined = oos.merge(labels, on=["symbol", "trade_date"], how="left")
+            oos["trade_date"] = pd.to_datetime(oos["trade_date"]).dt.normalize()
+            label_columns = [f"label_{h}" for h in self.config.labels.horizons]
+            report_columns = [*label_columns, "raw_return_20"]
+            joined_parts: list[pd.DataFrame] = []
+            for year in sorted(set(oos["trade_date"].dt.year)):
+                oos_year = oos[oos["trade_date"].dt.year.eq(year)]
+                labels = self.store.read_derived_year(
+                    "labels",
+                    int(year),
+                    columns=["symbol", "trade_date", *report_columns],
+                    float32_columns=report_columns,
+                )
+                if labels.empty:
+                    joined_parts.append(oos_year.copy())
+                    continue
+                labels["trade_date"] = pd.to_datetime(labels["trade_date"]).dt.normalize()
+                labels = labels[labels["trade_date"].isin(oos_year["trade_date"].unique())]
+                if labels.duplicated(["symbol", "trade_date"]).any():
+                    raise ValueError(
+                        f"labels year={year} violates symbol + trade_date one-to-one"
+                    )
+                joined_parts.append(
+                    oos_year.merge(
+                        labels,
+                        on=["symbol", "trade_date"],
+                        how="left",
+                        validate="one_to_one",
+                    )
+                )
+            joined = pd.concat(joined_parts, ignore_index=True) if joined_parts else oos.copy()
             dates: pd.Series | None = None
             for horizon in self.config.labels.horizons:
                 ic = rank_ic_by_date(joined, f"Alpha{horizon}", f"label_{horizon}")

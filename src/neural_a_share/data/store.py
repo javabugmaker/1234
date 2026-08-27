@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 class ParquetStore:
@@ -148,6 +150,41 @@ class ParquetStore:
         path = self.derived_dir / name / f"year={int(year)}" / f"{name}.parquet"
         self._atomic_parquet(frame, path)
         return path
+
+    def read_derived_year(
+        self,
+        name: str,
+        year: int,
+        columns: Iterable[str] | None = None,
+        float32_columns: Iterable[str] = (),
+    ) -> pd.DataFrame:
+        """Read exactly one existing derived partition with an optional narrow schema.
+
+        Floating-point narrowing happens in Arrow before conversion to pandas.  That
+        prevents pandas from first materializing a wide float64 block and then making
+        another equally wide consolidation copy.  Existing float64 parquet partitions
+        remain fully compatible and do not need to be rebuilt.
+        """
+
+        path = self.derived_dir / name / f"year={int(year)}" / f"{name}.parquet"
+        if not path.exists():
+            return pd.DataFrame(columns=list(columns) if columns is not None else None)
+        selected = list(columns) if columns is not None else None
+        table = pq.ParquetFile(path).read(columns=selected)
+        narrow = set(float32_columns)
+        if narrow:
+            arrays = []
+            fields = []
+            for field, column in zip(table.schema, table.columns):
+                if field.name in narrow and (
+                    pa.types.is_floating(field.type) or pa.types.is_null(field.type)
+                ):
+                    column = column.cast(pa.float32(), safe=False)
+                    field = pa.field(field.name, pa.float32(), nullable=field.nullable)
+                arrays.append(column)
+                fields.append(field)
+            table = pa.Table.from_arrays(arrays, schema=pa.schema(fields))
+        return table.to_pandas(split_blocks=True)
 
     def read_derived_years(
         self,

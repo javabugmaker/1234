@@ -53,6 +53,28 @@ def test_checkpoint_round_trip(tmp_path) -> None:
     assert np.allclose(normalizer.transform(sample), loaded_normalizer.transform(sample))
 
 
+def test_feature_normalizer_matches_vectorized_reference_without_wide_float64_copy() -> None:
+    rng = np.random.default_rng(42)
+    values = rng.normal(size=(2_000, 17)).astype("float32")
+    values[::113, 3] = np.nan
+    reference = values.astype("float64")
+    center = np.nanmedian(reference, axis=0)
+    scale = np.nanquantile(reference, 0.75, axis=0) - np.nanquantile(
+        reference, 0.25, axis=0
+    )
+    center = np.where(np.isfinite(center), center, 0.0)
+    scale = np.where(np.isfinite(scale) & (scale > 1e-6), scale, 1.0)
+    expected = np.where(np.isfinite(reference), reference, center)
+    expected = np.clip((expected - center) / scale, -10.0, 10.0).astype("float32")
+
+    normalizer = FeatureNormalizer().fit(values)
+    actual = normalizer.transform(values)
+    assert actual.dtype == np.dtype("float32")
+    assert np.array_equal(normalizer.center, center)
+    assert np.array_equal(normalizer.scale, scale)
+    assert np.array_equal(actual, expected)
+
+
 def test_mlp_trains_three_heads_on_cpu() -> None:
     rng = np.random.default_rng(3)
     x = rng.normal(size=(160, 8)).astype("float32")

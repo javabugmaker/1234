@@ -60,11 +60,19 @@ class FeatureNormalizer:
     scale: np.ndarray | None = None
 
     def fit(self, values: np.ndarray) -> "FeatureNormalizer":
-        array = np.asarray(values, dtype=np.float64)
-        self.center = np.nanmedian(array, axis=0)
-        q25 = np.nanquantile(array, 0.25, axis=0)
-        q75 = np.nanquantile(array, 0.75, axis=0)
-        self.scale = q75 - q25
+        array = np.asarray(values)
+        if array.ndim != 2:
+            raise ValueError("normalizer input must be a 2D matrix")
+        # Compute the identical robust statistics one column at a time.  The
+        # previous whole-matrix float64 cast costs ~2.3 GiB at 2.5M x 122 even
+        # when the source features are already float32.
+        self.center = np.empty(array.shape[1], dtype=np.float64)
+        self.scale = np.empty(array.shape[1], dtype=np.float64)
+        for index in range(array.shape[1]):
+            column = np.asarray(array[:, index], dtype=np.float64)
+            self.center[index] = np.nanmedian(column)
+            q25, q75 = np.nanquantile(column, (0.25, 0.75))
+            self.scale[index] = q75 - q25
         self.center = np.where(np.isfinite(self.center), self.center, 0.0)
         self.scale = np.where(np.isfinite(self.scale) & (self.scale > 1e-6), self.scale, 1.0)
         return self
@@ -72,9 +80,19 @@ class FeatureNormalizer:
     def transform(self, values: np.ndarray) -> np.ndarray:
         if self.center is None or self.scale is None:
             raise ValueError("normalizer is not fitted")
-        array = np.asarray(values, dtype=np.float64)
-        array = np.where(np.isfinite(array), array, self.center)
-        return np.clip((array - self.center) / self.scale, -10.0, 10.0).astype("float32")
+        array = np.asarray(values)
+        if array.ndim != 2 or array.shape[1] != len(self.center):
+            raise ValueError("normalizer input shape does not match fitted features")
+        output = np.empty(array.shape, dtype="float32")
+        for start in range(0, len(array), 65_536):
+            stop = min(start + 65_536, len(array))
+            block = np.asarray(array[start:stop], dtype=np.float64).copy()
+            np.copyto(block, self.center, where=~np.isfinite(block))
+            block -= self.center
+            block /= self.scale
+            np.clip(block, -10.0, 10.0, out=block)
+            output[start:stop] = block
+        return output
 
     def state_dict(self) -> dict[str, list[float]]:
         if self.center is None or self.scale is None:
