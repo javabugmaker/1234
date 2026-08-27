@@ -153,9 +153,14 @@ TickFlow.free() 增量日 K
 - TickFlow 最新日期
 - CUDA/GPU 或 CPU fallback
 - Champion 版本与 TrainingCutoff
+- 显式 `DEGRADED 研究模式` 开关；当前 Champion 已标记 degraded 时首次启动会自动勾选
 - Rolling IC20/40/60
 - Top 股票、Alpha20/40/60、NeuralAlpha、NeuralRank
 - 进度、日志和 Champion/Challenger 管理
+
+GUI 中“训练模型”和“Walk Forward”使用同一个 Survivorship 模式开关。关闭时严格
+fail-closed；开启时保留历史缓存样本，并把模型和 Walk-Forward 产物明确标记为
+`DEGRADED`，不会改变日期切分、Purge/Embargo 或统计口径。
 
 ## 测试
 

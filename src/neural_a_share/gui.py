@@ -15,6 +15,13 @@ from .model import ModelRegistry, select_device
 from .pipeline import NeuralAlphaPipeline
 
 
+def _model_is_degraded(champion: str | None, model: dict[str, Any]) -> bool:
+    """Recover the explicit GUI research mode from persisted model metadata."""
+
+    status = str(model.get("survivorship_status", "")).upper()
+    return status == "DEGRADED" or str(champion or "").lower().endswith("-degraded")
+
+
 def _cuda_text() -> str:
     try:
         import torch
@@ -44,6 +51,8 @@ class NeuralAlphaApp:
         self.busy = False
         self.status_vars: dict[str, tk.StringVar] = {}
         self.buttons: list[Any] = []
+        self.allow_degraded_survivorship = False
+        self._survivorship_mode_initialized = False
         self._style()
         self._build()
         self._refresh_status()
@@ -62,6 +71,18 @@ class NeuralAlphaApp:
         style.configure("Muted.TLabel", background="#0d1b2d", foreground="#8fa5bd")
         style.configure("TButton", padding=(11, 8), background="#11243a", foreground="#edf5ff")
         style.map("TButton", background=[("active", "#173653"), ("disabled", "#132032")])
+        style.configure(
+            "TCheckbutton",
+            background="#07111f",
+            foreground="#edf5ff",
+            indicatorcolor="#11243a",
+        )
+        style.map(
+            "TCheckbutton",
+            background=[("active", "#07111f"), ("disabled", "#07111f")],
+            foreground=[("disabled", "#60758c")],
+            indicatorcolor=[("selected", "#46d9ff")],
+        )
         style.configure("Treeview", background="#0d1b2d", foreground="#edf5ff", fieldbackground="#0d1b2d", rowheight=27)
         style.configure("Treeview.Heading", background="#11243a", foreground="#8fa5bd")
         style.configure("Horizontal.TProgressbar", troughcolor="#11243a", background="#46d9ff")
@@ -88,13 +109,32 @@ class NeuralAlphaApp:
             self.status_vars[key] = var
             self.ttk.Label(frame, textvariable=var, style="Card.TLabel", font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(5, 0))
 
+        mode_bar = self.ttk.Frame(self.root)
+        mode_bar.pack(fill="x", padx=22, pady=(4, 0))
+        self.degraded_mode_var = self.tk.BooleanVar(value=False)
+        self.degraded_mode_text = self.tk.StringVar()
+        mode_toggle = self.ttk.Checkbutton(
+            mode_bar,
+            text="DEGRADED 研究模式（历史 universe 不可追溯）",
+            variable=self.degraded_mode_var,
+            command=self._sync_degraded_mode,
+        )
+        mode_toggle.pack(side="left")
+        self.buttons.append(mode_toggle)
+        self.ttk.Label(
+            mode_bar,
+            textvariable=self.degraded_mode_text,
+            foreground="#ffb45f",
+        ).pack(side="left", padx=14)
+        self._sync_degraded_mode()
+
         toolbar = self.ttk.Frame(self.root)
         toolbar.pack(fill="x", padx=22, pady=9)
         actions: list[tuple[str, Callable[[], Any]]] = [
             ("更新 TickFlow", lambda: self._pipeline().update_tickflow(False)),
             ("每日运行", lambda: self._pipeline().daily(False)),
-            ("训练模型", lambda: self._pipeline().train(False)),
-            ("Walk Forward", lambda: self._pipeline().walk_forward()),
+            ("训练模型", self._train_model),
+            ("Walk Forward", self._walk_forward),
             ("回测", lambda: self._pipeline().run_backtest()),
             ("日报", lambda: self._pipeline().daily(True)),
             ("周报", lambda: self._pipeline().weekly()),
@@ -147,6 +187,29 @@ class NeuralAlphaApp:
         return NeuralAlphaPipeline(
             load_config(self.config_path),
             progress=lambda message, value: self.events.put(("progress", (message, value))),
+        )
+
+    def _sync_degraded_mode(self, enabled: bool | None = None) -> None:
+        if enabled is not None:
+            self.degraded_mode_var.set(bool(enabled))
+        self.allow_degraded_survivorship = bool(self.degraded_mode_var.get())
+        if self.allow_degraded_survivorship:
+            self.degraded_mode_text.set(
+                "已开启：训练与 Walk Forward 会明确标记 DEGRADED（非 strict OOS）"
+            )
+        else:
+            self.degraded_mode_text.set(
+                "严格模式：历史早于首份 universe snapshot 时会拒绝运行"
+            )
+
+    def _train_model(self) -> Any:
+        return self._pipeline().train(
+            allow_degraded_survivorship=self.allow_degraded_survivorship
+        )
+
+    def _walk_forward(self) -> pd.DataFrame:
+        return self._pipeline().walk_forward(
+            allow_degraded_survivorship=self.allow_degraded_survivorship
         )
 
     def _run(self, name: str, callback: Callable[[], Any]) -> None:
@@ -210,6 +273,9 @@ class NeuralAlphaApp:
         registry = ModelRegistry(self.config.paths.models_dir).read()
         champion = registry.get("champion")
         model = registry.get("models", {}).get(champion, {}) if champion else {}
+        if not self._survivorship_mode_initialized:
+            self._sync_degraded_mode(_model_is_degraded(champion, model))
+            self._survivorship_mode_initialized = True
         manifest_path = self.config.paths.cache_dir / "manifests" / "tickflow.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
         self.status_vars["latest"].set(str(manifest.get("latest_date", "未更新"))[:10])
